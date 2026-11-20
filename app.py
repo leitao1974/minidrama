@@ -21,7 +21,7 @@ from PIL import Image, ImageDraw, ImageFont
 # CONFIGURAÇÃO BASE
 # ---------------------------------------------------------
 st.set_page_config(
-    page_title="MiniDrama Studio — Elenco & Diálogos (v4)",
+    page_title="MiniDrama Studio — Elenco & Diálogos (v4.1)",
     page_icon="🎬",
     layout="wide",
 )
@@ -96,7 +96,6 @@ CAMERA_MOTIONS = {
     "pan_left": "Panorâmica Esquerda",
 }
 
-# Cores ASS em formato &HAABBGGRR (Branco, Amarelo-Ouro, Azul Claro)
 CHAR_SUBTITLE_COLORS = ["&H00FFFFFF", "&H0055E6FF", "&H00FFD480", "&H00A8FF99"]
 
 DEMO_EPISODE = {
@@ -163,6 +162,99 @@ DEMO_EPISODE = {
 
 
 # ---------------------------------------------------------
+# DETEÇÃO AUTOMÁTICA DE MODELOS GEMINI DISPONÍVEIS
+# ---------------------------------------------------------
+def _make_gemini_client(api_key: str):
+    from google import genai
+    from google.genai import types
+
+    return genai.Client(
+        api_key=api_key.strip(),
+        http_options=types.HttpOptions(api_version="v1beta"),
+    )
+
+
+def _dedupe(items: list[str]) -> list[str]:
+    seen = set()
+    out = []
+    for x in items:
+        if x and x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
+
+
+def discover_gemini_models(client) -> list[str]:
+    names = []
+    try:
+        for m in client.models.list():
+            raw = getattr(m, "name", "") or ""
+            short = raw.replace("models/", "").strip()
+            if short:
+                names.append(short)
+    except Exception:
+        pass
+    return names
+
+
+def get_text_model_candidates(client) -> list[str]:
+    discovered = discover_gemini_models(client)
+    blocked = ("image", "tts", "embedding", "aqa", "audio", "veo", "imagen", "live", "native", "robotics", "computer-use", "lyria")
+    flash_found = sorted(
+        [m for m in discovered if m.startswith("gemini-") and "flash" in m and not any(b in m for b in blocked)],
+        reverse=True,
+    )
+    other_found = sorted(
+        [m for m in discovered if m.startswith("gemini-") and "flash" not in m and not any(b in m for b in blocked)],
+        reverse=True,
+    )
+    return _dedupe(
+        ["gemini-3.8-flash"]
+        + flash_found
+        + ["gemini-3.0-flash", "gemini-2.5-flash", "gemini-2.0-flash"]
+        + other_found
+    )
+
+
+def get_image_model_candidates(client) -> tuple[list[str], list[str]]:
+    discovered = discover_gemini_models(client)
+    gemini_imgs = sorted(
+        [m for m in discovered if m.startswith("gemini-") and "image" in m],
+        reverse=True,
+    )
+    imagen_models = sorted(
+        [m for m in discovered if m.startswith("imagen-")],
+        reverse=True,
+    )
+    gemini_list = _dedupe(
+        gemini_imgs
+        + [
+            "gemini-3.8-flash-image",
+            "gemini-3.0-flash-image",
+            "gemini-2.5-flash-image",
+            "gemini-2.0-flash-exp-image-generation",
+        ]
+    )
+    imagen_list = _dedupe(
+        imagen_models + ["imagen-4.0-generate-001", "imagen-3.0-generate-002"]
+    )
+    return gemini_list, imagen_list
+
+
+def get_tts_model_candidates(client) -> list[str]:
+    discovered = discover_gemini_models(client)
+    tts_found = sorted([m for m in discovered if "tts" in m], reverse=True)
+    return _dedupe(
+        tts_found
+        + [
+            "gemini-2.5-flash-preview-tts",
+            "gemini-3.8-flash-preview-tts",
+            "gemini-3.0-flash-preview-tts",
+        ]
+    )
+
+
+# ---------------------------------------------------------
 # UTILITÁRIOS DE FONTES E VOZES
 # ---------------------------------------------------------
 def find_linux_ttf() -> str | None:
@@ -219,7 +311,7 @@ def pick_default_voice_label(engine_label: str, gender: str, char_idx: int) -> s
 
 
 # ---------------------------------------------------------
-# GERAÇÃO DE GUIÃO MULTI-PERSONAGEM (GEMINI)
+# GERAÇÃO DE GUIÃO MULTI-PERSONAGEM (GEMINI AUTO-MODELO)
 # ---------------------------------------------------------
 def generate_episode_script_gemini(
     api_key: str,
@@ -229,13 +321,11 @@ def generate_episode_script_gemini(
     num_scenes: int,
     num_chars: int,
 ) -> dict:
-    from google import genai
     from google.genai import types
 
-    client = genai.Client(
-        api_key=api_key.strip(),
-        http_options=types.HttpOptions(api_version="v1beta"),
-    )
+    client = _make_gemini_client(api_key)
+    candidates = get_text_model_candidates(client)
+
     prompt = f"""
 Cria um guião viral para um mini-drama vertical (TikTok/Reels) no género "{genre}", em {lang_label}, com exatamente {num_chars} personagens principais em diálogo direto e {num_scenes} cenas.
 Premissa: {premise}
@@ -279,21 +369,36 @@ Devolve APENAS um objeto JSON válido neste formato exato:
   ]
 }}
 """
-    resp = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=prompt,
-        config=types.GenerateContentConfig(response_mime_type="application/json"),
-    )
-    raw = (resp.text or "").strip()
-    if raw.startswith("```"):
-        raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
-    data = json.loads(raw)
+    last_err = None
+    for model_id in candidates[:6]:
+        try:
+            try:
+                resp = client.models.generate_content(
+                    model=model_id,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(response_mime_type="application/json"),
+                )
+            except Exception as inner_e:
+                if "JSON mode" in str(inner_e) or "response_mime_type" in str(inner_e):
+                    resp = client.models.generate_content(model=model_id, contents=prompt)
+                else:
+                    raise
 
-    if isinstance(data, list):
-        raise RuntimeError("O modelo devolveu uma lista em vez do objeto com elenco e cenas. Tenta novamente.")
-    if not data.get("characters") or not data.get("scenes"):
-        raise RuntimeError("O guião gerado veio incompleto (sem elenco ou sem cenas). Tenta novamente.")
-    return data
+            raw = (resp.text or "").strip()
+            if raw.startswith("```"):
+                raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+            s_i, e_i = raw.find("{"), raw.rfind("}")
+            if s_i != -1 and e_i != -1:
+                raw = raw[s_i : e_i + 1]
+
+            data = json.loads(raw)
+            if isinstance(data, dict) and data.get("characters") and data.get("scenes"):
+                return data
+        except Exception as e:
+            last_err = f"[{model_id}] {e}"
+            continue
+
+    raise RuntimeError(f"Nenhum modelo Gemini respondeu ao pedido de guião. Último erro: {last_err}")
 
 
 # ---------------------------------------------------------
@@ -320,16 +425,14 @@ def _extract_gemini_image(resp) -> bytes | None:
 
 
 def generate_portrait_gemini(char: dict, api_key: str) -> bytes:
-    from google import genai
     from google.genai import types
 
     if not api_key.strip():
         raise RuntimeError("Cola a tua chave API Google Gemini na barra lateral.")
 
-    client = genai.Client(
-        api_key=api_key.strip(),
-        http_options=types.HttpOptions(api_version="v1beta"),
-    )
+    client = _make_gemini_client(api_key)
+    gemini_imgs, imagen_models = get_image_model_candidates(client)
+
     prompt = (
         f"Generate a clean vertical 9:16 cinematic character reference portrait photo of {char['name']}. "
         f"Appearance: {char['visual_profile']}. "
@@ -338,7 +441,7 @@ def generate_portrait_gemini(char: dict, api_key: str) -> bytes:
     )
 
     last_err = None
-    for model_id in ["gemini-2.5-flash-image", "gemini-2.0-flash-exp-image-generation"]:
+    for model_id in gemini_imgs[:5]:
         try:
             resp = client.models.generate_content(
                 model=model_id,
@@ -349,7 +452,20 @@ def generate_portrait_gemini(char: dict, api_key: str) -> bytes:
             if img_bytes:
                 return img_bytes
         except Exception as e:
-            last_err = e
+            last_err = f"[{model_id}] {e}"
+            continue
+
+    for imagen_id in imagen_models[:3]:
+        try:
+            resp = client.models.generate_images(
+                model=imagen_id,
+                prompt=prompt,
+                config=types.GenerateImagesConfig(number_of_images=1, aspect_ratio="9:16"),
+            )
+            if resp.generated_images:
+                return normalize_image_bytes(resp.generated_images[0].image.image_bytes)
+        except Exception as e:
+            last_err = f"[{imagen_id}] {e}"
             continue
 
     raise RuntimeError(f"Não foi possível gerar o retrato de {char['name']}: {last_err}")
@@ -360,20 +476,13 @@ def generate_scene_image_with_refs_gemini(
     api_key: str,
     ref_chars: list[tuple[str, str, bytes]],
 ) -> bytes:
-    """
-    Gera a imagem da cena enviando os retratos-referência das personagens presentes
-    para garantir consistência de rosto e roupa.
-    """
-    from google import genai
     from google.genai import types
 
     if not api_key.strip():
         raise RuntimeError("Cola a tua chave API Google Gemini na barra lateral.")
 
-    client = genai.Client(
-        api_key=api_key.strip(),
-        http_options=types.HttpOptions(api_version="v1beta"),
-    )
+    client = _make_gemini_client(api_key)
+    gemini_imgs, imagen_models = get_image_model_candidates(client)
 
     contents = []
     if ref_chars:
@@ -391,7 +500,7 @@ def generate_scene_image_with_refs_gemini(
     )
 
     last_err = None
-    for model_id in ["gemini-2.5-flash-image", "gemini-2.0-flash-exp-image-generation"]:
+    for model_id in gemini_imgs[:5]:
         try:
             resp = client.models.generate_content(
                 model=model_id,
@@ -402,15 +511,27 @@ def generate_scene_image_with_refs_gemini(
             if img_bytes:
                 return img_bytes
         except Exception as e:
-            last_err = e
+            last_err = f"[{model_id}] {e}"
             continue
 
-    # Fallback sem imagens-referência caso o modelo rejeite o formato multimodal
     if ref_chars:
         desc_block = "; ".join(f"{n}: {vp}" for n, vp, _ in ref_chars)
         return generate_scene_image_with_refs_gemini(
             f"{prompt}. Characters appearance: {desc_block}", api_key, []
         )
+
+    for imagen_id in imagen_models[:3]:
+        try:
+            resp = client.models.generate_images(
+                model=imagen_id,
+                prompt=prompt,
+                config=types.GenerateImagesConfig(number_of_images=1, aspect_ratio="9:16"),
+            )
+            if resp.generated_images:
+                return normalize_image_bytes(resp.generated_images[0].image.image_bytes)
+        except Exception as e:
+            last_err = f"[{imagen_id}] {e}"
+            continue
 
     raise RuntimeError(f"Erro ao gerar imagem da cena no Gemini: {last_err}")
 
@@ -479,16 +600,13 @@ def generate_tts_gemini_dramatic(
     api_key: str,
     out_wav: Path,
 ):
-    from google import genai
     from google.genai import types
 
     if not api_key.strip():
         raise RuntimeError("Cola a tua chave API Google Gemini na barra lateral para usar a Voz Dramática.")
 
-    client = genai.Client(
-        api_key=api_key.strip(),
-        http_options=types.HttpOptions(api_version="v1beta"),
-    )
+    client = _make_gemini_client(api_key)
+    tts_candidates = get_tts_model_candidates(client)
 
     direction = voice_direction.strip() or "dramatic thriller tone, expressive and intense"
     tts_prompt = (
@@ -496,31 +614,42 @@ def generate_tts_gemini_dramatic(
         f"Do not add extra words:\n{text}"
     )
 
-    resp = client.models.generate_content(
-        model="gemini-2.5-flash-preview-tts",
-        contents=tts_prompt,
-        config=types.GenerateContentConfig(
-            response_modalities=["AUDIO"],
-            speech_config=types.SpeechConfig(
-                voice_config=types.VoiceConfig(
-                    prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=voice_name)
-                )
-            ),
-        ),
-    )
-
+    last_err = None
     audio_bytes = None
-    for candidate in getattr(resp, "candidates", []) or []:
-        content = getattr(candidate, "content", None)
-        for part in getattr(content, "parts", []) or []:
-            inline = getattr(part, "inline_data", None)
-            data = getattr(inline, "data", None) if inline else None
-            if data:
-                audio_bytes = base64.b64decode(data) if isinstance(data, str) else data
+
+    for model_id in tts_candidates[:4]:
+        try:
+            resp = client.models.generate_content(
+                model=model_id,
+                contents=tts_prompt,
+                config=types.GenerateContentConfig(
+                    response_modalities=["AUDIO"],
+                    speech_config=types.SpeechConfig(
+                        voice_config=types.VoiceConfig(
+                            prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=voice_name)
+                        )
+                    ),
+                ),
+            )
+            for candidate in getattr(resp, "candidates", []) or []:
+                content = getattr(candidate, "content", None)
+                for part in getattr(content, "parts", []) or []:
+                    inline = getattr(part, "inline_data", None)
+                    data = getattr(inline, "data", None) if inline else None
+                    if data:
+                        audio_bytes = base64.b64decode(data) if isinstance(data, str) else data
+                        break
+            if audio_bytes:
                 break
+        except Exception as e:
+            last_err = f"[{model_id}] {e}"
+            continue
 
     if not audio_bytes:
-        raise RuntimeError("O modelo de voz Gemini não devolveu áudio para esta cena.")
+        raise RuntimeError(
+            f"O motor de voz Gemini falhou ({last_err}). "
+            "Se esta chave não tiver quota TTS, muda o Motor de Voz na barra lateral para Edge-TTS ou ElevenLabs."
+        )
 
     if audio_bytes[:4] == b"RIFF":
         out_wav.write_bytes(audio_bytes)
@@ -670,7 +799,7 @@ def build_ass_file(characters: list[dict], dialogue_rows: list[tuple[float, floa
 def build_zoompan_filter(motion: str, frames: int, fps: int = 30) -> str:
     safe_frames = max(1, frames)
     if motion == "pull_out":
-        zp = f"zoompan=z='max(1.14-0.0009*on,1.0)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
+        zp = "zoompan=z='max(1.14-0.0009*on,1.0)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
     elif motion == "pan_right":
         zp = f"zoompan=z='1.12':x='(iw-iw/zoom)*(on/{safe_frames})':y='ih/2-(ih/zoom/2)'"
     elif motion == "pan_left":
@@ -745,7 +874,6 @@ def render_episode(
         camera_motion = scene.get("camera_motion", "push_in")
         visual_prompt = scene.get("visual_prompt", "")
 
-        # 1. Imagem da cena
         if idx in uploaded_images and uploaded_images[idx] is not None:
             Image.open(uploaded_images[idx]).convert("RGB").save(img_path, format="JPEG", quality=92)
         elif idx in ai_images and ai_images[idx]:
@@ -753,7 +881,6 @@ def render_episode(
         else:
             create_placeholder_card(img_path, idx + 1, speaker["name"], visual_prompt)
 
-        # 2. Voz da personagem desta cena
         progress_bar.progress(
             int((idx / total) * 70) + 2,
             text=f"Cena {idx + 1}/{total}: a gravar fala de {speaker['name']}...",
@@ -796,7 +923,6 @@ def render_episode(
         for s_ms, e_ms, txt in timings:
             ass_rows.append((offset_ms + s_ms, offset_ms + e_ms, speaker_id, txt))
 
-        # 3. Movimento de câmara
         fps = 30
         frames = max(1, math.ceil(scene_dur * fps))
         vf = build_zoompan_filter(camera_motion, frames, fps=fps)
@@ -810,7 +936,6 @@ def render_episode(
             cwd=job_dir,
         )
 
-        # 4. Fundir vídeo e voz
         run_cmd(
             [
                 "ffmpeg", "-y",
@@ -829,7 +954,6 @@ def render_episode(
         scene_videos.append(merged_vid)
         progress_bar.progress(int(((idx + 1) / total) * 75), text=f"Cena {idx + 1}/{total} montada...")
 
-    # 5. Concatenar cenas + escrever legendas ASS
     (job_dir / "concat.txt").write_text(
         "\n".join(f"file '{v.name}'" for v in scene_videos), encoding="utf-8"
     )
@@ -844,7 +968,6 @@ def render_episode(
     total_dur = get_duration(stitched_mp4)
     progress_bar.progress(86, text="A aplicar legendas de diálogo e ambiente sonoro...")
 
-    # 6. Música de fundo + legendas ASS + marca d'água
     bgm_path = None
     if bgm_mode == "Atmosfera Suspense Automática (integrada)":
         bgm_path = job_dir / "bgm_auto.m4a"
@@ -913,7 +1036,7 @@ if "last_video" not in st.session_state:
 if "script_ver" not in st.session_state:
     st.session_state.script_ver = 0
 
-st.title("🎬 MiniDrama Studio — v4 (Elenco Fixo & Diálogos)")
+st.title("🎬 MiniDrama Studio — v4.1 (Elenco Fixo & Diálogos)")
 st.caption("Várias personagens com retrato-referência consistente, vozes individuais e diálogo dramático em 9:16.")
 
 if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
@@ -927,6 +1050,20 @@ with st.sidebar:
     st.header("Configurações")
     gemini_key = st.text_input("Chave API Google Gemini", type="password")
     lang_label = st.selectbox("Idioma / Sotaque", list(LANGUAGES.keys()))
+
+    with st.expander("🔍 Verificar modelos da chave"):
+        if st.button("Listar modelos ativos"):
+            if not gemini_key:
+                st.warning("Cola a chave Gemini acima.")
+            else:
+                try:
+                    c = _make_gemini_client(gemini_key)
+                    t_mods = get_text_model_candidates(c)[:3]
+                    i_mods, im_mods = get_image_model_candidates(c)
+                    st.write("**Texto:**", ", ".join(t_mods))
+                    st.write("**Imagem:**", ", ".join((i_mods + im_mods)[:3]))
+                except Exception as e:
+                    st.error(str(e))
 
     st.divider()
     st.subheader("🎭 Motor de Vozes do Elenco")
@@ -1092,7 +1229,6 @@ if st.session_state.characters:
                         except Exception as e:
                             st.error(str(e))
 
-# Mapa consolidado dos retratos ativos (upload manual tem prioridade sobre IA)
 active_cast_portraits = dict(st.session_state.cast_images)
 active_cast_portraits.update(uploaded_cast)
 char_map = {c["id"]: c for c in st.session_state.characters}
