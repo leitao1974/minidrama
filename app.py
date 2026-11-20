@@ -1,6 +1,7 @@
 import asyncio
 import json
 import math
+import os
 import shutil
 import subprocess
 import uuid
@@ -56,13 +57,48 @@ DEMO_SCENES = [
 
 
 # ---------------------------------------------------------
+# UTILITÁRIOS DE FONTES (WINDOWS + LINUX / STREAMLIT CLOUD)
+# ---------------------------------------------------------
+def find_linux_ttf() -> str | None:
+    candidates = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+    ]
+    for path in candidates:
+        if Path(path).exists():
+            return path
+    return None
+
+
+def load_pil_font(size: int):
+    for name in [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "arial.ttf",
+    ]:
+        try:
+            return ImageFont.truetype(name, size)
+        except OSError:
+            continue
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:
+        return ImageFont.load_default()
+
+
+# ---------------------------------------------------------
 # FUNÇÕES DO MOTOR DE IA E VÍDEO
 # ---------------------------------------------------------
 def generate_script_gemini(api_key: str, premise: str, genre: str, lang: str, num_scenes: int) -> list[dict]:
     from google import genai
     from google.genai import types
 
-    client = genai.Client(api_key=api_key)
+    client = genai.Client(
+        api_key=api_key.strip(),
+        http_options=types.HttpOptions(api_version="v1beta"),
+    )
     prompt = f"""
 Cria um guião viral para um mini-drama vertical (TikTok/Reels) no género "{genre}", em {lang}, com exatamente {num_scenes} cenas.
 Premissa: {premise}
@@ -87,7 +123,10 @@ Devolve APENAS um JSON válido com uma lista de objetos neste formato:
         contents=prompt,
         config=types.GenerateContentConfig(response_mime_type="application/json"),
     )
-    return json.loads(resp.text)
+    raw = (resp.text or "").strip()
+    if raw.startswith("```"):
+        raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+    return json.loads(raw)
 
 
 def create_placeholder_card(path: Path, scene_num: int, prompt_text: str):
@@ -95,24 +134,17 @@ def create_placeholder_card(path: Path, scene_num: int, prompt_text: str):
     img = Image.new("RGB", (1080, 1920), (16, 18, 28))
     draw = ImageDraw.Draw(img)
 
-    # Gradiente vertical subtil
     for y in range(1920):
         tone = int(16 + (y / 1920) * 28)
         draw.line([(0, y), (1080, y)], fill=(tone, tone + 2, tone + 16))
 
-    # Moldura discreta
     draw.rectangle([70, 120, 1010, 1800], outline=(90, 105, 150), width=3)
 
-    try:
-        font_title = ImageFont.truetype("arial.ttf", 72)
-        font_body = ImageFont.truetype("arial.ttf", 34)
-    except OSError:
-        font_title = ImageFont.load_default()
-        font_body = ImageFont.load_default()
+    font_title = load_pil_font(72)
+    font_body = load_pil_font(34)
 
     draw.text((120, 260), f"CENA {scene_num:02d}", fill=(240, 200, 110), font=font_title)
 
-    # Quebra simples de linhas para mostrar o prompt visual no cartão de teste
     words = prompt_text.split()
     lines, current = [], []
     for w in words:
@@ -198,22 +230,24 @@ def render_episode(scenes: list[dict], uploaded_images: dict, voice_id: str, wat
         clip_vid = job_dir / f"{prefix}_vid.mp4"
         merged_vid = job_dir / f"{prefix}_merged.mp4"
 
+        dialogue = scene.get("dialogue", "").strip()
+        visual_prompt = scene.get("visual_prompt", "")
+
         # 1. Imagem da cena (carregada ou cartão temporário)
         if idx in uploaded_images and uploaded_images[idx] is not None:
             img = Image.open(uploaded_images[idx]).convert("RGB")
             img.save(img_path, format="JPEG", quality=92)
         else:
-            create_placeholder_card(img_path, idx + 1, scene["visual_prompt"])
+            create_placeholder_card(img_path, idx + 1, visual_prompt)
 
         # 2. Voz neural + tempos de legenda
-        timings = asyncio.run(generate_tts(scene["dialogue"], voice_id, audio_path))
+        timings = asyncio.run(generate_tts(dialogue, voice_id, audio_path))
         audio_dur = get_duration(audio_path)
         scene_dur = audio_dur + 0.35
 
         # Fallback automático caso o serviço TTS não envie tempos palavra-a-palavra
         if not timings:
-            words = scene["dialogue"].split()
-            step = max(1, math.ceil(len(words) / 4))
+            words = dialogue.split()
             parts = [" ".join(words[i : i + 4]) for i in range(0, len(words), 4)]
             slot = (audio_dur * 1000) / max(1, len(parts))
             timings = [(i * slot, (i + 1) * slot, p) for i, p in enumerate(parts)]
@@ -280,14 +314,20 @@ def render_episode(scenes: list[dict], uploaded_images: dict, voice_id: str, wat
 
     # 6. Queimar legendas e marca d'água opcional
     sub_style = (
-        "FontName=Arial,FontSize=15,Bold=1,"
+        "FontName=DejaVu Sans,FontSize=15,Bold=1,"
         "PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,"
         "Outline=2,Shadow=1,Alignment=2,MarginV=85"
     )
     filters = [f"subtitles=captions.srt:force_style='{sub_style}'"]
+
     if watermark:
+        font_opt = ""
+        if os.name != "nt":
+            linux_ttf = find_linux_ttf()
+            if linux_ttf:
+                font_opt = f"fontfile={linux_ttf}:"
         filters.append(
-            "drawtext=text='MiniDrama Studio':fontcolor=white@0.45:fontsize=28:x=w-tw-36:y=48"
+            f"drawtext={font_opt}text='MiniDrama Studio':fontcolor=white@0.45:fontsize=28:x=w-tw-36:y=48"
         )
 
     final_mp4 = job_dir / "episodio_final.mp4"
@@ -317,7 +357,7 @@ st.title("🎬 MiniDrama Studio — Protótipo v1")
 st.caption("Cria episódios verticais 9:16 com guião IA, voz neural e legendas automáticas.")
 
 if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
-    st.error("FFmpeg não encontrado no sistema. Instala o FFmpeg primeiro para gerar vídeos.")
+    st.error("FFmpeg não encontrado no sistema. Confirma se o ficheiro packages.txt contém 'ffmpeg'.")
     st.stop()
 
 with st.sidebar:
@@ -369,47 +409,12 @@ if st.session_state.scenes:
             c_txt, c_img = st.columns([2, 1])
             with c_txt:
                 scene["dialogue"] = st.text_area(
-                    "Fala / Narração", value=scene["dialogue"], key=f"diag_{i}", height=75
+                    "Fala / Narração", value=scene.get("dialogue", ""), key=f"diag_{i}", height=75
                 )
                 scene["visual_prompt"] = st.text_input(
                     "Prompt visual (usado na Etapa 2 para gerar imagem IA)",
-                    value=scene["visual_prompt"],
+                    value=scene.get("visual_prompt", ""),
                     key=f"vis_{i}",
                 )
             with c_img:
-                uploaded_images[i] = st.file_uploader(
-                    "Imagem opcional (JPG/PNG)", type=["jpg", "jpeg", "png"], key=f"img_{i}"
-                )
-
-    # PASSO 3: RENDERIZAR
-    st.divider()
-    st.subheader("3. Produzir Episódio Vertical (9:16)")
-    if st.button("🎥 Gerar Vídeo Completo (Modo Rápido)", type="primary"):
-        bar = st.progress(5, text="A iniciar motor de renderização...")
-        try:
-            out_path = render_episode(
-                scenes=st.session_state.scenes,
-                uploaded_images=uploaded_images,
-                voice_id=VOICES[voice_label],
-                watermark=watermark,
-                progress_bar=bar,
-            )
-            st.session_state.last_video = out_path
-        except Exception as e:
-            st.error(f"Ocorreu um erro na renderização: {e}")
-
-if st.session_state.last_video and Path(st.session_state.last_video).exists():
-    st.divider()
-    v_col, d_col = st.columns([1, 2])
-    with v_col:
-        st.video(str(st.session_state.last_video))
-    with d_col:
-        st.success("Vídeo pronto a publicar em formato 1080×1920!")
-        with open(st.session_state.last_video, "rb") as f:
-            st.download_button(
-                "⬇️ Descarregar MP4",
-                data=f.read(),
-                file_name="minidrama_episodio.mp4",
-                mime="video/mp4",
-                type="primary",
-            )
+                uploaded_images[i] = st.file_
