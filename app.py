@@ -1,17 +1,15 @@
 import asyncio
+import base64
 import io
 import json
 import math
 import os
-import random
 import shutil
 import subprocess
 import uuid
 from pathlib import Path
-from urllib.parse import quote
 
 import edge_tts
-import requests
 import streamlit as st
 from PIL import Image, ImageDraw, ImageFont
 
@@ -37,8 +35,8 @@ VOICES = {
 }
 
 IMAGE_PROVIDERS = [
-    "Pollinations.ai — Flux (Grátis, sem chave)",
-    "Hugging Face — FLUX.1-schnell (Grátis com token)",
+    "Hugging Face — FLUX / SDXL (Auto-servidor, grátis com token)",
+    "Google Gemini — Imagens (usa a chave Gemini da barra lateral)",
 ]
 
 DEMO_SCENES = [
@@ -140,7 +138,7 @@ Devolve APENAS um JSON válido com uma lista de objetos neste formato:
 
 
 # ---------------------------------------------------------
-# GERAÇÃO GRATUITA DE IMAGENS IA (TESTES)
+# GERAÇÃO DE IMAGENS IA (HUGGING FACE AUTO + GEMINI)
 # ---------------------------------------------------------
 def normalize_image_bytes(raw_bytes: bytes) -> bytes:
     img = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
@@ -149,49 +147,103 @@ def normalize_image_bytes(raw_bytes: bytes) -> bytes:
     return buf.getvalue()
 
 
-def generate_image_pollinations(prompt: str, seed: int | None = None) -> bytes:
-    clean_prompt = " ".join(prompt.split())[:420]
-    seed_val = seed if seed is not None else random.randint(1, 999999)
-    url = (
-        f"https://image.pollinations.ai/prompt/{quote(clean_prompt)}"
-        f"?width=720&height=1280&nologo=true&model=flux&seed={seed_val}"
-    )
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-    resp = requests.get(url, headers=headers, timeout=90)
-    if resp.status_code != 200:
-        raise RuntimeError(
-            f"Pollinations respondeu com código {resp.status_code}. "
-            "Tenta novamente dentro de segundos ou muda para Hugging Face na barra lateral."
-        )
-    if "image" not in resp.headers.get("Content-Type", ""):
-        raise RuntimeError("O serviço gratuito não devolveu uma imagem válida (possível limite temporário).")
-    return normalize_image_bytes(resp.content)
-
-
 def generate_image_huggingface(prompt: str, hf_token: str) -> bytes:
+    from huggingface_hub import InferenceClient
+
     if not hf_token.strip():
         raise RuntimeError("Cola o teu token gratuito do Hugging Face na barra lateral.")
-    url = "https://router.huggingface.co/hf-inference/models/black-forest-labs/FLUX.1-schnell"
-    headers = {
-        "Authorization": f"Bearer {hf_token.strip()}",
-        "Accept": "image/jpeg",
-    }
-    payload = {
-        "inputs": prompt,
-        "parameters": {"width": 768, "height": 1344},
-    }
-    resp = requests.post(url, headers=headers, json=payload, timeout=90)
-    if resp.status_code == 503:
-        raise RuntimeError("O modelo gratuito no Hugging Face está a acordar. Aguarda 15 segundos e tenta novamente.")
-    if resp.status_code != 200:
-        raise RuntimeError(f"Erro Hugging Face ({resp.status_code}): {resp.text[:250]}")
-    return normalize_image_bytes(resp.content)
+
+    client = InferenceClient(provider="auto", api_key=hf_token.strip())
+    models_to_try = [
+        "black-forest-labs/FLUX.1-schnell",
+        "stabilityai/stable-diffusion-xl-base-1.0",
+    ]
+    last_err = None
+
+    for model_id in models_to_try:
+        try:
+            try:
+                img = client.text_to_image(
+                    prompt,
+                    model=model_id,
+                    width=768,
+                    height=1344,
+                )
+            except Exception:
+                img = client.text_to_image(prompt, model=model_id)
+
+            buf = io.BytesIO()
+            img.convert("RGB").save(buf, format="JPEG", quality=92)
+            return buf.getvalue()
+        except Exception as e:
+            last_err = e
+            continue
+
+    raise RuntimeError(f"Erro Hugging Face: {last_err}")
 
 
-def generate_scene_image(prompt: str, provider: str, hf_token: str) -> bytes:
-    if provider.startswith("Pollinations"):
-        return generate_image_pollinations(prompt)
-    return generate_image_huggingface(prompt, hf_token)
+def generate_image_gemini(prompt: str, api_key: str) -> bytes:
+    from google import genai
+    from google.genai import types
+
+    if not api_key.strip():
+        raise RuntimeError("Cola a tua chave API Google Gemini na barra lateral.")
+
+    client = genai.Client(
+        api_key=api_key.strip(),
+        http_options=types.HttpOptions(api_version="v1beta"),
+    )
+
+    last_err = None
+
+    # 1. Modelos nativos de geração de imagem Gemini
+    for model_id in ["gemini-2.5-flash-image", "gemini-2.0-flash-exp-image-generation"]:
+        try:
+            resp = client.models.generate_content(
+                model=model_id,
+                contents=f"Generate a vertical 9:16 cinematic photorealistic frame with no text: {prompt}",
+                config=types.GenerateContentConfig(
+                    response_modalities=["IMAGE", "TEXT"],
+                ),
+            )
+            for candidate in getattr(resp, "candidates", []) or []:
+                content = getattr(candidate, "content", None)
+                for part in getattr(content, "parts", []) or []:
+                    inline = getattr(part, "inline_data", None)
+                    data = getattr(inline, "data", None) if inline else None
+                    if data:
+                        if isinstance(data, str):
+                            data = base64.b64decode(data)
+                        return normalize_image_bytes(data)
+        except Exception as e:
+            last_err = e
+            continue
+
+    # 2. Alternativa Imagen (caso esteja ativa na chave)
+    for imagen_model in ["imagen-3.0-generate-002", "imagen-4.0-generate-001"]:
+        try:
+            resp = client.models.generate_images(
+                model=imagen_model,
+                prompt=prompt,
+                config=types.GenerateImagesConfig(
+                    number_of_images=1,
+                    aspect_ratio="9:16",
+                ),
+            )
+            if resp.generated_images:
+                img_bytes = resp.generated_images[0].image.image_bytes
+                return normalize_image_bytes(img_bytes)
+        except Exception as e:
+            last_err = e
+            continue
+
+    raise RuntimeError(f"A chave Gemini não conseguiu gerar imagem: {last_err}")
+
+
+def generate_scene_image(prompt: str, provider: str, hf_token: str, gemini_key: str) -> bytes:
+    if provider.startswith("Hugging Face"):
+        return generate_image_huggingface(prompt, hf_token)
+    return generate_image_gemini(prompt, gemini_key)
 
 
 def create_placeholder_card(path: Path, scene_num: int, prompt_text: str):
@@ -430,8 +482,8 @@ if "last_video" not in st.session_state:
 if "script_ver" not in st.session_state:
     st.session_state.script_ver = 0
 
-st.title("🎬 MiniDrama Studio — Protótipo v2")
-st.caption("Guião IA + Imagens IA gratuitas (9:16) + Voz neural e legendas sincronizadas.")
+st.title("🎬 MiniDrama Studio — Protótipo v2.1")
+st.caption("Guião IA + Imagens IA (9:16) + Voz neural e legendas sincronizadas.")
 
 if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
     st.error("FFmpeg não encontrado no sistema. Confirma se o ficheiro packages.txt contém 'ffmpeg'.")
@@ -439,17 +491,17 @@ if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
 
 with st.sidebar:
     st.header("Configurações")
-    gemini_key = st.text_input("Chave API Google Gemini (guião)", type="password")
+    gemini_key = st.text_input("Chave API Google Gemini", type="password")
     voice_label = st.selectbox("Voz do narrador", list(VOICES.keys()))
     watermark = st.checkbox("Incluir marca d'água (plano grátis)", value=True)
 
     st.divider()
     st.subheader("Motor de Imagens (Testes)")
-    img_provider = st.selectbox("Serviço gratuito", IMAGE_PROVIDERS)
+    img_provider = st.selectbox("Serviço de imagem", IMAGE_PROVIDERS)
     hf_token = ""
     if "Hugging Face" in img_provider:
         hf_token = st.text_input("Token Hugging Face (gratuito)", type="password")
-        st.caption("Cria um token grátis (Read) em huggingface.co/settings/tokens.")
+        st.caption("Usa o teu token Fine-grained com permissão 'Make calls to Inference Providers'.")
 
 # PASSO 1: GERAR GUIÃO
 st.subheader("1. Ideia do Episódio")
@@ -488,24 +540,29 @@ with b2:
         st.session_state.script_ver += 1
         st.rerun()
 
-# PASSO 2: STORYBOARD + IMAGENS IA GRATUITAS
+# PASSO 2: STORYBOARD + IMAGENS IA
 if st.session_state.scenes:
     st.divider()
     st.subheader("2. Storyboard e Imagens IA (9:16)")
 
-    if st.button("🎨 Gerar Imagens IA para Todas as Cenas (Grátis)", type="primary"):
+    if st.button("🎨 Gerar Imagens IA para Todas as Cenas", type="primary"):
         img_bar = st.progress(0, text="A gerar imagens...")
         total_s = len(st.session_state.scenes)
+        had_error = False
         for i, scene in enumerate(st.session_state.scenes):
             img_bar.progress(int((i / total_s) * 100), text=f"A gerar imagem da Cena {i + 1}/{total_s}...")
             try:
                 st.session_state.scene_images[i] = generate_scene_image(
-                    scene.get("visual_prompt", ""), img_provider, hf_token
+                    scene.get("visual_prompt", ""), img_provider, hf_token, gemini_key
                 )
             except Exception as e:
+                had_error = True
+                img_bar.empty()
                 st.error(f"Cena {i + 1}: {e}")
                 break
-        img_bar.progress(100, text="Imagens geradas!")
+        if not had_error:
+            img_bar.progress(100, text="Todas as imagens foram geradas!")
+            st.rerun()
 
     uploaded_images = {}
     ver = st.session_state.script_ver
@@ -529,7 +586,7 @@ if st.session_state.scenes:
                     with st.spinner(f"A gerar imagem da Cena {i + 1}..."):
                         try:
                             st.session_state.scene_images[i] = generate_scene_image(
-                                scene["visual_prompt"], img_provider, hf_token
+                                scene["visual_prompt"], img_provider, hf_token, gemini_key
                             )
                             st.rerun()
                         except Exception as e:
