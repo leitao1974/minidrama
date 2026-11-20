@@ -21,7 +21,7 @@ from PIL import Image, ImageDraw, ImageFont
 # CONFIGURAÇÃO BASE
 # ---------------------------------------------------------
 st.set_page_config(
-    page_title="MiniDrama Studio — Elenco & Diálogos (v4.1)",
+    page_title="MiniDrama Studio — Elenco & Diálogos (v4.2)",
     page_icon="🎬",
     layout="wide",
 )
@@ -162,7 +162,7 @@ DEMO_EPISODE = {
 
 
 # ---------------------------------------------------------
-# DETEÇÃO AUTOMÁTICA DE MODELOS GEMINI DISPONÍVEIS
+# DETEÇÃO AUTOMÁTICA DE MODELOS GEMINI DA CHAVE
 # ---------------------------------------------------------
 def _make_gemini_client(api_key: str):
     from google import genai
@@ -184,68 +184,84 @@ def _dedupe(items: list[str]) -> list[str]:
     return out
 
 
-def discover_gemini_models(client) -> list[str]:
-    names = []
+@st.cache_data(ttl=300, show_spinner=False)
+def list_key_models(api_key: str) -> dict[str, list[str]]:
+    """Consulta a API Gemini e classifica os modelos realmente ativos nesta chave."""
+    if not api_key or len(api_key.strip()) < 10:
+        return {"all": [], "text": [], "image": [], "tts": []}
+
+    client = _make_gemini_client(api_key)
+    all_names: list[str] = []
     try:
         for m in client.models.list():
             raw = getattr(m, "name", "") or ""
             short = raw.replace("models/", "").strip()
             if short:
-                names.append(short)
+                all_names.append(short)
     except Exception:
-        pass
-    return names
+        return {"all": [], "text": [], "image": [], "tts": []}
 
-
-def get_text_model_candidates(client) -> list[str]:
-    discovered = discover_gemini_models(client)
-    blocked = ("image", "tts", "embedding", "aqa", "audio", "veo", "imagen", "live", "native", "robotics", "computer-use", "lyria")
-    flash_found = sorted(
-        [m for m in discovered if m.startswith("gemini-") and "flash" in m and not any(b in m for b in blocked)],
+    blocked_text = (
+        "image", "tts", "embedding", "aqa", "audio", "veo", "imagen",
+        "live", "native", "robotics", "computer-use", "lyria", "banana",
+    )
+    flash_text = sorted(
+        [m for m in all_names if m.startswith("gemini-") and "flash" in m and not any(b in m for b in blocked_text)],
         reverse=True,
     )
-    other_found = sorted(
-        [m for m in discovered if m.startswith("gemini-") and "flash" not in m and not any(b in m for b in blocked)],
+    other_text = sorted(
+        [m for m in all_names if m.startswith("gemini-") and "flash" not in m and not any(b in m for b in blocked_text)],
         reverse=True,
     )
-    return _dedupe(
-        ["gemini-3.8-flash"]
-        + flash_found
-        + ["gemini-3.0-flash", "gemini-2.5-flash", "gemini-2.0-flash"]
-        + other_found
-    )
 
-
-def get_image_model_candidates(client) -> tuple[list[str], list[str]]:
-    discovered = discover_gemini_models(client)
+    # Prioriza modelos nativos de imagem Gemini (funcionam no AI Studio) antes de Imagen
     gemini_imgs = sorted(
-        [m for m in discovered if m.startswith("gemini-") and "image" in m],
+        [m for m in all_names if ("image" in m or "banana" in m) and not m.startswith("imagen-")],
         reverse=True,
     )
-    imagen_models = sorted(
-        [m for m in discovered if m.startswith("imagen-")],
+    imagen_imgs = sorted(
+        [m for m in all_names if m.startswith("imagen-")],
         reverse=True,
     )
-    gemini_list = _dedupe(
-        gemini_imgs
-        + [
+    tts_models = sorted([m for m in all_names if "tts" in m], reverse=True)
+
+    return {
+        "all": sorted(all_names),
+        "text": _dedupe(flash_text + other_text),
+        "image": _dedupe(gemini_imgs + imagen_imgs),
+        "tts": _dedupe(tts_models),
+    }
+
+
+def get_text_candidates(api_key: str, preferred: str = "Automático") -> list[str]:
+    info = list_key_models(api_key)
+    base = info["text"] if info["text"] else ["gemini-3.8-flash", "gemini-3.0-flash", "gemini-2.5-flash"]
+    if preferred and preferred != "Automático":
+        return _dedupe([preferred] + base)
+    return _dedupe(base + ["gemini-3.8-flash"])
+
+
+def get_image_candidates(api_key: str, preferred: str = "Automático") -> list[str]:
+    info = list_key_models(api_key)
+    # Se a chave devolveu lista real de modelos, usa primeiro os dela
+    if info["image"]:
+        base = info["image"]
+    else:
+        base = [
             "gemini-3.8-flash-image",
             "gemini-3.0-flash-image",
             "gemini-2.5-flash-image",
             "gemini-2.0-flash-exp-image-generation",
         ]
-    )
-    imagen_list = _dedupe(
-        imagen_models + ["imagen-4.0-generate-001", "imagen-3.0-generate-002"]
-    )
-    return gemini_list, imagen_list
+    if preferred and preferred != "Automático":
+        return _dedupe([preferred] + base)
+    return _dedupe(base)
 
 
-def get_tts_model_candidates(client) -> list[str]:
-    discovered = discover_gemini_models(client)
-    tts_found = sorted([m for m in discovered if "tts" in m], reverse=True)
+def get_tts_candidates(api_key: str) -> list[str]:
+    info = list_key_models(api_key)
     return _dedupe(
-        tts_found
+        info["tts"]
         + [
             "gemini-2.5-flash-preview-tts",
             "gemini-3.8-flash-preview-tts",
@@ -311,7 +327,7 @@ def pick_default_voice_label(engine_label: str, gender: str, char_idx: int) -> s
 
 
 # ---------------------------------------------------------
-# GERAÇÃO DE GUIÃO MULTI-PERSONAGEM (GEMINI AUTO-MODELO)
+# GERAÇÃO DE GUIÃO MULTI-PERSONAGEM (GEMINI)
 # ---------------------------------------------------------
 def generate_episode_script_gemini(
     api_key: str,
@@ -320,11 +336,12 @@ def generate_episode_script_gemini(
     lang_label: str,
     num_scenes: int,
     num_chars: int,
+    preferred_model: str = "Automático",
 ) -> dict:
     from google.genai import types
 
     client = _make_gemini_client(api_key)
-    candidates = get_text_model_candidates(client)
+    candidates = get_text_candidates(api_key, preferred_model)
 
     prompt = f"""
 Cria um guião viral para um mini-drama vertical (TikTok/Reels) no género "{genre}", em {lang_label}, com exatamente {num_chars} personagens principais em diálogo direto e {num_scenes} cenas.
@@ -369,8 +386,8 @@ Devolve APENAS um objeto JSON válido neste formato exato:
   ]
 }}
 """
-    last_err = None
-    for model_id in candidates[:6]:
+    errors = []
+    for model_id in candidates[:5]:
         try:
             try:
                 resp = client.models.generate_content(
@@ -395,14 +412,14 @@ Devolve APENAS um objeto JSON válido neste formato exato:
             if isinstance(data, dict) and data.get("characters") and data.get("scenes"):
                 return data
         except Exception as e:
-            last_err = f"[{model_id}] {e}"
+            errors.append(f"{model_id}: {str(e)[:180]}")
             continue
 
-    raise RuntimeError(f"Nenhum modelo Gemini respondeu ao pedido de guião. Último erro: {last_err}")
+    raise RuntimeError("Nenhum modelo de texto respondeu.\n" + "\n".join(errors))
 
 
 # ---------------------------------------------------------
-# GERAÇÃO DE IMAGENS IA (RETRATOS + CENAS COM REFERÊNCIA)
+# GERAÇÃO DE IMAGENS IA (COM DIAGNÓSTICO TRANSPARENTE)
 # ---------------------------------------------------------
 def normalize_image_bytes(raw_bytes: bytes) -> bytes:
     img = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
@@ -424,14 +441,36 @@ def _extract_gemini_image(resp) -> bytes | None:
     return None
 
 
-def generate_portrait_gemini(char: dict, api_key: str) -> bytes:
+def _call_single_image_model(client, model_id: str, contents, text_only_prompt: str) -> bytes:
     from google.genai import types
 
+    if model_id.startswith("imagen-"):
+        resp = client.models.generate_images(
+            model=model_id,
+            prompt=text_only_prompt,
+            config=types.GenerateImagesConfig(number_of_images=1, aspect_ratio="9:16"),
+        )
+        if resp.generated_images:
+            return normalize_image_bytes(resp.generated_images[0].image.image_bytes)
+        raise RuntimeError("Modelo Imagen não devolveu imagem.")
+
+    resp = client.models.generate_content(
+        model=model_id,
+        contents=contents,
+        config=types.GenerateContentConfig(response_modalities=["IMAGE", "TEXT"]),
+    )
+    img_bytes = _extract_gemini_image(resp)
+    if img_bytes:
+        return img_bytes
+    raise RuntimeError("Resposta sem imagem (apenas texto ou bloqueio de segurança).")
+
+
+def generate_portrait_gemini(char: dict, api_key: str, preferred_model: str = "Automático") -> bytes:
     if not api_key.strip():
         raise RuntimeError("Cola a tua chave API Google Gemini na barra lateral.")
 
     client = _make_gemini_client(api_key)
-    gemini_imgs, imagen_models = get_image_model_candidates(client)
+    candidates = get_image_candidates(api_key, preferred_model)
 
     prompt = (
         f"Generate a clean vertical 9:16 cinematic character reference portrait photo of {char['name']}. "
@@ -440,41 +479,24 @@ def generate_portrait_gemini(char: dict, api_key: str) -> bytes:
         "cinematic 35mm film lighting, photorealistic, sharp focus, NO text, NO watermarks."
     )
 
-    last_err = None
-    for model_id in gemini_imgs[:5]:
+    errors = []
+    for model_id in candidates[:6]:
         try:
-            resp = client.models.generate_content(
-                model=model_id,
-                contents=prompt,
-                config=types.GenerateContentConfig(response_modalities=["IMAGE", "TEXT"]),
-            )
-            img_bytes = _extract_gemini_image(resp)
-            if img_bytes:
-                return img_bytes
+            return _call_single_image_model(client, model_id, prompt, prompt)
         except Exception as e:
-            last_err = f"[{model_id}] {e}"
+            errors.append(f"• {model_id} → {str(e)[:200]}")
             continue
 
-    for imagen_id in imagen_models[:3]:
-        try:
-            resp = client.models.generate_images(
-                model=imagen_id,
-                prompt=prompt,
-                config=types.GenerateImagesConfig(number_of_images=1, aspect_ratio="9:16"),
-            )
-            if resp.generated_images:
-                return normalize_image_bytes(resp.generated_images[0].image.image_bytes)
-        except Exception as e:
-            last_err = f"[{imagen_id}] {e}"
-            continue
-
-    raise RuntimeError(f"Não foi possível gerar o retrato de {char['name']}: {last_err}")
+    raise RuntimeError(
+        f"Não foi possível gerar o retrato de {char['name']}. Modelos tentados:\n" + "\n".join(errors)
+    )
 
 
 def generate_scene_image_with_refs_gemini(
     prompt: str,
     api_key: str,
     ref_chars: list[tuple[str, str, bytes]],
+    preferred_model: str = "Automático",
 ) -> bytes:
     from google.genai import types
 
@@ -482,7 +504,7 @@ def generate_scene_image_with_refs_gemini(
         raise RuntimeError("Cola a tua chave API Google Gemini na barra lateral.")
 
     client = _make_gemini_client(api_key)
-    gemini_imgs, imagen_models = get_image_model_candidates(client)
+    candidates = get_image_candidates(api_key, preferred_model)
 
     contents = []
     if ref_chars:
@@ -493,47 +515,25 @@ def generate_scene_image_with_refs_gemini(
             contents.append(f"Character '{name}' ({visual_profile}):")
             contents.append(types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg"))
 
-    contents.append(
+    final_instruction = (
         "Generate ONE vertical 9:16 photorealistic 35mm cinematic movie frame matching the exact face(s) and outfit(s) above. "
         "Do NOT include any text, logos, captions, or split screens. "
         f"Scene description: {prompt}"
     )
+    contents.append(final_instruction)
 
-    last_err = None
-    for model_id in gemini_imgs[:5]:
+    desc_block = "; ".join(f"{n}: {vp}" for n, vp, _ in ref_chars)
+    text_fallback_prompt = f"{prompt}. Characters appearance: {desc_block}" if desc_block else prompt
+
+    errors = []
+    for model_id in candidates[:6]:
         try:
-            resp = client.models.generate_content(
-                model=model_id,
-                contents=contents,
-                config=types.GenerateContentConfig(response_modalities=["IMAGE", "TEXT"]),
-            )
-            img_bytes = _extract_gemini_image(resp)
-            if img_bytes:
-                return img_bytes
+            return _call_single_image_model(client, model_id, contents, text_fallback_prompt)
         except Exception as e:
-            last_err = f"[{model_id}] {e}"
+            errors.append(f"• {model_id} → {str(e)[:200]}")
             continue
 
-    if ref_chars:
-        desc_block = "; ".join(f"{n}: {vp}" for n, vp, _ in ref_chars)
-        return generate_scene_image_with_refs_gemini(
-            f"{prompt}. Characters appearance: {desc_block}", api_key, []
-        )
-
-    for imagen_id in imagen_models[:3]:
-        try:
-            resp = client.models.generate_images(
-                model=imagen_id,
-                prompt=prompt,
-                config=types.GenerateImagesConfig(number_of_images=1, aspect_ratio="9:16"),
-            )
-            if resp.generated_images:
-                return normalize_image_bytes(resp.generated_images[0].image.image_bytes)
-        except Exception as e:
-            last_err = f"[{imagen_id}] {e}"
-            continue
-
-    raise RuntimeError(f"Erro ao gerar imagem da cena no Gemini: {last_err}")
+    raise RuntimeError("Não foi possível gerar a imagem da cena. Modelos tentados:\n" + "\n".join(errors))
 
 
 def create_placeholder_card(path: Path, scene_num: int, speaker_name: str, prompt_text: str):
@@ -606,7 +606,7 @@ def generate_tts_gemini_dramatic(
         raise RuntimeError("Cola a tua chave API Google Gemini na barra lateral para usar a Voz Dramática.")
 
     client = _make_gemini_client(api_key)
-    tts_candidates = get_tts_model_candidates(client)
+    tts_candidates = get_tts_candidates(api_key)
 
     direction = voice_direction.strip() or "dramatic thriller tone, expressive and intense"
     tts_prompt = (
@@ -614,7 +614,7 @@ def generate_tts_gemini_dramatic(
         f"Do not add extra words:\n{text}"
     )
 
-    last_err = None
+    errors = []
     audio_bytes = None
 
     for model_id in tts_candidates[:4]:
@@ -642,13 +642,13 @@ def generate_tts_gemini_dramatic(
             if audio_bytes:
                 break
         except Exception as e:
-            last_err = f"[{model_id}] {e}"
+            errors.append(f"{model_id}: {str(e)[:160]}")
             continue
 
     if not audio_bytes:
         raise RuntimeError(
-            f"O motor de voz Gemini falhou ({last_err}). "
-            "Se esta chave não tiver quota TTS, muda o Motor de Voz na barra lateral para Edge-TTS ou ElevenLabs."
+            "O motor de voz Gemini falhou:\n" + "\n".join(errors) +
+            "\n\nDica: podes mudar o Motor de Voz na barra lateral para Edge-TTS (grátis) ou ElevenLabs."
         )
 
     if audio_bytes[:4] == b"RIFF":
@@ -1036,7 +1036,7 @@ if "last_video" not in st.session_state:
 if "script_ver" not in st.session_state:
     st.session_state.script_ver = 0
 
-st.title("🎬 MiniDrama Studio — v4.1 (Elenco Fixo & Diálogos)")
+st.title("🎬 MiniDrama Studio — v4.2 (Elenco Fixo & Diálogos)")
 st.caption("Várias personagens com retrato-referência consistente, vozes individuais e diálogo dramático em 9:16.")
 
 if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
@@ -1051,19 +1051,27 @@ with st.sidebar:
     gemini_key = st.text_input("Chave API Google Gemini", type="password")
     lang_label = st.selectbox("Idioma / Sotaque", list(LANGUAGES.keys()))
 
-    with st.expander("🔍 Verificar modelos da chave"):
-        if st.button("Listar modelos ativos"):
-            if not gemini_key:
-                st.warning("Cola a chave Gemini acima.")
-            else:
-                try:
-                    c = _make_gemini_client(gemini_key)
-                    t_mods = get_text_model_candidates(c)[:3]
-                    i_mods, im_mods = get_image_model_candidates(c)
-                    st.write("**Texto:**", ", ".join(t_mods))
-                    st.write("**Imagem:**", ", ".join((i_mods + im_mods)[:3]))
-                except Exception as e:
-                    st.error(str(e))
+    key_models = list_key_models(gemini_key) if gemini_key else {"all": [], "text": [], "image": [], "tts": []}
+    preferred_text_model = "Automático"
+    preferred_image_model = "Automático"
+
+    with st.expander("🔍 Modelos ativos nesta chave", expanded=False):
+        if not gemini_key:
+            st.caption("Cola a chave Gemini acima para listar os modelos.")
+        elif not key_models["all"]:
+            st.warning("Não foi possível listar modelos desta chave (verifica se é válida).")
+        else:
+            preferred_text_model = st.selectbox(
+                "Modelo de Guião (Texto)",
+                ["Automático"] + key_models["text"],
+            )
+            preferred_image_model = st.selectbox(
+                "Modelo de Imagens",
+                ["Automático"] + key_models["image"],
+            )
+            st.caption(f"Encontrados: {len(key_models['text'])} texto | {len(key_models['image'])} imagem | {len(key_models['tts'])} voz")
+            if not key_models["image"]:
+                st.warning("Esta chave não devolveu nenhum modelo de geração de imagem ativo.")
 
     st.divider()
     st.subheader("🎭 Motor de Vozes do Elenco")
@@ -1119,7 +1127,7 @@ with b1:
             with st.spinner("A criar o elenco e o diálogo entre personagens..."):
                 try:
                     ep = generate_episode_script_gemini(
-                        gemini_key, premise, genre, lang_label, num_scenes, num_chars
+                        gemini_key, premise, genre, lang_label, num_scenes, num_chars, preferred_text_model
                     )
                     st.session_state.episode_title = ep.get("title", "Novo Episódio")
                     st.session_state.characters = ep["characters"]
@@ -1168,7 +1176,9 @@ if st.session_state.characters:
             for ci, ch in enumerate(st.session_state.characters):
                 pbar.progress(int((ci / n_ch) * 100), text=f"A gerar retrato de {ch['name']}...")
                 try:
-                    st.session_state.cast_images[ch["id"]] = generate_portrait_gemini(ch, gemini_key)
+                    st.session_state.cast_images[ch["id"]] = generate_portrait_gemini(
+                        ch, gemini_key, preferred_image_model
+                    )
                     if ci < n_ch - 1:
                         time.sleep(1.0)
                 except Exception as e:
@@ -1224,7 +1234,9 @@ if st.session_state.characters:
                 if st.button(f"🔄 Gerar / Refazer retrato de {ch['name']}", key=f"cregen_{ver}_{cid}"):
                     with st.spinner(f"A gerar retrato de {ch['name']}..."):
                         try:
-                            st.session_state.cast_images[cid] = generate_portrait_gemini(ch, gemini_key)
+                            st.session_state.cast_images[cid] = generate_portrait_gemini(
+                                ch, gemini_key, preferred_image_model
+                            )
                             st.rerun()
                         except Exception as e:
                             st.error(str(e))
@@ -1259,7 +1271,7 @@ if st.session_state.scenes and st.session_state.characters:
                         refs.append((char_map[cid]["name"], char_map[cid]["visual_profile"], active_cast_portraits[cid]))
                 try:
                     st.session_state.scene_images[i] = generate_scene_image_with_refs_gemini(
-                        scene.get("visual_prompt", ""), gemini_key, refs
+                        scene.get("visual_prompt", ""), gemini_key, refs, preferred_image_model
                     )
                     if i < total_s - 1:
                         time.sleep(1.0)
@@ -1365,7 +1377,7 @@ if st.session_state.scenes and st.session_state.characters:
                                 if cid in char_map and cid in active_cast_portraits
                             ]
                             st.session_state.scene_images[i] = generate_scene_image_with_refs_gemini(
-                                scene["visual_prompt"], gemini_key, refs
+                                scene["visual_prompt"], gemini_key, refs, preferred_image_model
                             )
                             st.rerun()
                         except Exception as e:
