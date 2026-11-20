@@ -417,4 +417,39 @@ if st.session_state.scenes:
                     key=f"vis_{i}",
                 )
             with c_img:
-                uploaded_images[i] = st.file_
+                uploaded_images[i] = st.file_uploader(
+                    "Imagem opcional (JPG/PNG)", type=["jpg", "jpeg", "png"], key=f"img_{i}"
+                )
+
+    # PASSO 3: RENDERIZAR
+    st.divider()
+    st.subheader("3. Produzir Episódio Vertical (9:16)")
+    if st.button("🎥 Gerar Vídeo Completo (Modo Rápido)", type="primary"):
+        bar = st.progress(5, text="A iniciar motor de renderização...")
+        try:
+            out_path = render_episode(
+                scenes=st.session_state.scenes,
+                uploaded_images=uploaded_images,
+                voice_id=VOICES[voice_label],
+                watermark=watermark,
+                progress_bar=bar,
+            )
+            st.session_state.last_video = out_path
+        except Exception as e:
+            st.error(f"Ocorreu um erro na renderização: {e}")
+
+if st.session_state.last_video and Path(st.session_state.last_video).exists():
+    st.divider()
+    v_col, d_col = st.columns([1, 2])
+    with v_col:
+        st.video(str(st.session_state.last_video))
+    with d_col:
+        st.success("Vídeo pronto a publicar em formato 1080×1920!")
+        with open(st.session_state.last_video, "rb") as f:
+            st.download_button(
+                "⬇️ Descarregar MP4",
+                data=f.read(),
+                file_name="minidrama_episodio.mp4",
+                mime="video/mp4",
+                type="primary",
+            )
