@@ -21,7 +21,7 @@ from PIL import Image, ImageDraw, ImageFont
 # CONFIGURAÇÃO BASE
 # ---------------------------------------------------------
 st.set_page_config(
-    page_title="MiniDrama Studio — Elenco & Diálogos (v4.2)",
+    page_title="MiniDrama Studio — Modo Cinema I2V (v5)",
     page_icon="🎬",
     layout="wide",
 )
@@ -34,6 +34,18 @@ VOICE_ENGINES = [
     "ElevenLabs — Qualidade Cinema (plano grátis / SaaS Pro)",
     "Edge-TTS — Leitura Rápida com Emoção (grátis ilimitado)",
 ]
+
+VIDEO_ENGINES = [
+    "Google Veo — via API Gemini (usa a tua chave Gemini paga)",
+    "fal.ai — Kling / Wan / Hailuo (mais económico para escala)",
+]
+
+FAL_VIDEO_MODELS = {
+    "Kling 1.6 Standard (5s — ótimo para drama/rostos)": "fal-ai/kling-video/v1.6/standard/image-to-video",
+    "Kling 2.1 Standard (5s — movimento mais natural)": "fal-ai/kling-video/v2.1/standard/image-to-video",
+    "MiniMax Hailuo 02 Standard (6s — expressões fortes)": "fal-ai/minimax/hailuo-02/standard/image-to-video",
+    "Wan Image-to-Video (económico para testes)": "fal-ai/wan-i2v",
+}
 
 GEMINI_VOICES = {
     "Kore — Feminina (Firme e dramática)": "Kore",
@@ -125,6 +137,8 @@ DEMO_EPISODE = {
             "emotion": "suspense",
             "voice_direction": "whispered, tense, breathless realization",
             "camera_motion": "push_in",
+            "render_mode": "fast",
+            "motion_prompt": "Slow cinematic camera push-in, Sofia's hands tremble slightly as she looks down at the secret papers and then glances nervously over her shoulder toward the dark doorway, realistic subtle facial expressions, 35mm film motion",
             "visual_prompt": "Close-up vertical 9:16 thriller shot inside a dimly lit luxury corporate office at night, Sofia holding confidential financial papers beside an open hidden wall safe, dramatic warm desk lamp lighting, photorealistic 35mm film",
         },
         {
@@ -135,6 +149,8 @@ DEMO_EPISODE = {
             "emotion": "frieza",
             "voice_direction": "cold, deep, threatening calm",
             "camera_motion": "pan_right",
+            "render_mode": "fast",
+            "motion_prompt": "Slow menacing dolly forward, Henrique steps slowly out of the doorway shadow into the dim blue moonlight, narrows his eyes and tilts his head with cold authority, realistic human movement",
             "visual_prompt": "Medium vertical 9:16 suspense shot in a dark corporate office doorway, Henrique standing partially in shadow leaning against the doorframe with a cold menacing expression, blue moonlight rim light, photorealistic 35mm film",
         },
         {
@@ -145,6 +161,8 @@ DEMO_EPISODE = {
             "emotion": "urgencia",
             "voice_direction": "defiant, angry, shaking with controlled courage",
             "camera_motion": "pull_out",
+            "render_mode": "fast",
+            "motion_prompt": "Subtle handheld thriller tension, Sofia raises the red folder firmly while speaking defiantly, Henrique leans forward slightly across the desk staring intensely, realistic cinematic drama",
             "visual_prompt": "Tense vertical 9:16 two-shot across a mahogany office desk at night, Sofia standing firmly holding a red folder confronting Henrique who steps closer in shadow, high-contrast thriller lighting, photorealistic 35mm film",
         },
         {
@@ -155,6 +173,8 @@ DEMO_EPISODE = {
             "emotion": "suspense",
             "voice_direction": "slow, chilling smirk in voice, dramatic pause before the end",
             "camera_motion": "push_in",
+            "render_mode": "fast",
+            "motion_prompt": "Slow tense push-in, Henrique forms a subtle chilling smirk and nods subtly downward toward the glowing smartphone screen on the desk, dramatic noir lighting flicker",
             "visual_prompt": "Dramatic vertical 9:16 over-the-shoulder close-up of Henrique smiling coldly while pointing slightly towards Sofia's glowing smartphone screen on the desk, tense noir thriller cliffhanger atmosphere, photorealistic 35mm film",
         },
     ],
@@ -186,9 +206,8 @@ def _dedupe(items: list[str]) -> list[str]:
 
 @st.cache_data(ttl=300, show_spinner=False)
 def list_key_models(api_key: str) -> dict[str, list[str]]:
-    """Consulta a API Gemini e classifica os modelos realmente ativos nesta chave."""
     if not api_key or len(api_key.strip()) < 10:
-        return {"all": [], "text": [], "image": [], "tts": []}
+        return {"all": [], "text": [], "image": [], "tts": [], "video": []}
 
     client = _make_gemini_client(api_key)
     all_names: list[str] = []
@@ -199,7 +218,7 @@ def list_key_models(api_key: str) -> dict[str, list[str]]:
             if short:
                 all_names.append(short)
     except Exception:
-        return {"all": [], "text": [], "image": [], "tts": []}
+        return {"all": [], "text": [], "image": [], "tts": [], "video": []}
 
     blocked_text = (
         "image", "tts", "embedding", "aqa", "audio", "veo", "imagen",
@@ -213,8 +232,6 @@ def list_key_models(api_key: str) -> dict[str, list[str]]:
         [m for m in all_names if m.startswith("gemini-") and "flash" not in m and not any(b in m for b in blocked_text)],
         reverse=True,
     )
-
-    # Prioriza modelos nativos de imagem Gemini (funcionam no AI Studio) antes de Imagen
     gemini_imgs = sorted(
         [m for m in all_names if ("image" in m or "banana" in m) and not m.startswith("imagen-")],
         reverse=True,
@@ -225,11 +242,16 @@ def list_key_models(api_key: str) -> dict[str, list[str]]:
     )
     tts_models = sorted([m for m in all_names if "tts" in m], reverse=True)
 
+    # Prioriza modelos Veo "fast" (mais rápidos e económicos)
+    fast_veo = sorted([m for m in all_names if m.startswith("veo-") and "fast" in m], reverse=True)
+    std_veo = sorted([m for m in all_names if m.startswith("veo-") and "fast" not in m], reverse=True)
+
     return {
         "all": sorted(all_names),
         "text": _dedupe(flash_text + other_text),
         "image": _dedupe(gemini_imgs + imagen_imgs),
         "tts": _dedupe(tts_models),
+        "video": _dedupe(fast_veo + std_veo),
     }
 
 
@@ -243,16 +265,23 @@ def get_text_candidates(api_key: str, preferred: str = "Automático") -> list[st
 
 def get_image_candidates(api_key: str, preferred: str = "Automático") -> list[str]:
     info = list_key_models(api_key)
-    # Se a chave devolveu lista real de modelos, usa primeiro os dela
-    if info["image"]:
-        base = info["image"]
-    else:
-        base = [
-            "gemini-3.8-flash-image",
-            "gemini-3.0-flash-image",
-            "gemini-2.5-flash-image",
-            "gemini-2.0-flash-exp-image-generation",
-        ]
+    base = info["image"] if info["image"] else [
+        "gemini-3.1-flash-image",
+        "gemini-2.5-flash-image",
+        "gemini-2.0-flash-exp-image-generation",
+    ]
+    if preferred and preferred != "Automático":
+        return _dedupe([preferred] + base)
+    return _dedupe(base)
+
+
+def get_video_candidates_veo(api_key: str, preferred: str = "Automático") -> list[str]:
+    info = list_key_models(api_key)
+    base = info["video"] if info["video"] else [
+        "veo-3.1-fast-generate-preview",
+        "veo-3.0-fast-generate-001",
+        "veo-2.0-generate-001",
+    ]
     if preferred and preferred != "Automático":
         return _dedupe([preferred] + base)
     return _dedupe(base)
@@ -327,7 +356,7 @@ def pick_default_voice_label(engine_label: str, gender: str, char_idx: int) -> s
 
 
 # ---------------------------------------------------------
-# GERAÇÃO DE GUIÃO MULTI-PERSONAGEM (GEMINI)
+# GERAÇÃO DE GUIÃO MULTI-PERSONAGEM + MOTION PROMPTS (GEMINI)
 # ---------------------------------------------------------
 def generate_episode_script_gemini(
     api_key: str,
@@ -350,7 +379,7 @@ Premissa: {premise}
 Regras obrigatórias:
 1. "characters": lista com exatamente {num_chars} personagens com IDs "char_1", "char_2" (e "char_3" se aplicável).
    - Cada personagem tem "name", "role", "gender" ("female" ou "male"), e "visual_profile" em INGLÊS muito específico (idade, rosto, cabelo, roupa exata).
-2. "scenes": lista com exatamente {num_scenes} cenas com diálogo real alternado entre as personagens (não é apenas um narrador).
+2. "scenes": lista com exatamente {num_scenes} cenas com diálogo real alternado entre as personagens.
    - Cena 1 tem gancho imediato nos primeiros 2 segundos; última cena termina em cliffhanger forte.
    - "speaker_id": ID da personagem que fala nesta cena ("char_1", "char_2", etc.).
    - "characters_in_scene": lista dos IDs das personagens visíveis no enquadramento (1 ou 2 personagens).
@@ -358,7 +387,8 @@ Regras obrigatórias:
    - "emotion": escolhe APENAS um de ["suspense", "urgencia", "frieza", "choque"].
    - "voice_direction": direção de ator curta em inglês (ex.: "cold threatening whisper").
    - "camera_motion": escolhe APENAS um de ["push_in", "pull_out", "pan_right", "pan_left"].
-   - "visual_prompt": descrição cinematográfica vertical 9:16 em INGLÊS, fotorrealista 35mm, SEM texto na imagem, referindo as personagens pelo nome e ação exata.
+   - "visual_prompt": descrição do fotograma inicial vertical 9:16 em INGLÊS, fotorrealista 35mm, SEM texto na imagem, referindo as personagens pelo nome.
+   - "motion_prompt": descrição em INGLÊS de 1 frase para animar este fotograma em vídeo (Image-to-Video): movimento realista do rosto, olhar, gesto das mãos e câmara lenta cinematográfica.
 
 Devolve APENAS um objeto JSON válido neste formato exato:
 {{
@@ -381,7 +411,8 @@ Devolve APENAS um objeto JSON válido neste formato exato:
       "emotion": "suspense",
       "voice_direction": "whispered tense thriller delivery",
       "camera_motion": "push_in",
-      "visual_prompt": "Cinematic vertical 9:16 photorealistic scene in English, no text"
+      "visual_prompt": "Cinematic vertical 9:16 photorealistic scene in English, no text",
+      "motion_prompt": "Slow cinematic camera push-in, character reacts tensely with realistic subtle eye and head movement"
     }}
   ]
 }}
@@ -410,6 +441,12 @@ Devolve APENAS um objeto JSON válido neste formato exato:
 
             data = json.loads(raw)
             if isinstance(data, dict) and data.get("characters") and data.get("scenes"):
+                for sc in data["scenes"]:
+                    sc.setdefault("render_mode", "fast")
+                    sc.setdefault(
+                        "motion_prompt",
+                        "Slow cinematic camera push-in, subtle realistic facial expression and tense breathing",
+                    )
                 return data
         except Exception as e:
             errors.append(f"{model_id}: {str(e)[:180]}")
@@ -419,7 +456,7 @@ Devolve APENAS um objeto JSON válido neste formato exato:
 
 
 # ---------------------------------------------------------
-# GERAÇÃO DE IMAGENS IA (COM DIAGNÓSTICO TRANSPARENTE)
+# GERAÇÃO DE IMAGENS IA (RETRATOS + CENAS)
 # ---------------------------------------------------------
 def normalize_image_bytes(raw_bytes: bytes) -> bytes:
     img = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
@@ -515,12 +552,11 @@ def generate_scene_image_with_refs_gemini(
             contents.append(f"Character '{name}' ({visual_profile}):")
             contents.append(types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg"))
 
-    final_instruction = (
+    contents.append(
         "Generate ONE vertical 9:16 photorealistic 35mm cinematic movie frame matching the exact face(s) and outfit(s) above. "
         "Do NOT include any text, logos, captions, or split screens. "
         f"Scene description: {prompt}"
     )
-    contents.append(final_instruction)
 
     desc_block = "; ".join(f"{n}: {vp}" for n, vp, _ in ref_chars)
     text_fallback_prompt = f"{prompt}. Characters appearance: {desc_block}" if desc_block else prompt
@@ -560,8 +596,217 @@ def create_placeholder_card(path: Path, scene_num: int, speaker_name: str, promp
     for line in lines[:9]:
         draw.text((120, y_pos), line, fill=(210, 215, 230), font=body_font)
         y_pos += 48
-
     img.save(path, format="JPEG", quality=92)
+
+
+# ---------------------------------------------------------
+# MOTORES DE VÍDEO ANIMADO (IMAGE-TO-VIDEO: GOOGLE VEO & FAL.AI)
+# ---------------------------------------------------------
+def generate_video_veo(
+    img_bytes: bytes,
+    motion_prompt: str,
+    api_key: str,
+    preferred_model: str = "Automático",
+    status_cb=None,
+) -> bytes:
+    from google.genai import types
+
+    if not api_key.strip():
+        raise RuntimeError("Cola a tua chave API Google Gemini paga na barra lateral.")
+
+    client = _make_gemini_client(api_key)
+    candidates = get_video_candidates_veo(api_key, preferred_model)
+    clean_motion = motion_prompt.strip() or "Subtle cinematic camera push-in, realistic human movement, 35mm film"
+
+    errors = []
+    operation = None
+    used_model = None
+
+    for model_id in candidates[:4]:
+        try:
+            if status_cb:
+                status_cb(f"A enviar fotograma para {model_id}...")
+            img_obj = types.Image(image_bytes=img_bytes, mime_type="image/jpeg")
+
+            # Tenta primeiro com 9:16 + allow_adult; faz fallback de config se o modelo rejeitar algum parâmetro
+            configs_to_try = [
+                types.GenerateVideosConfig(aspect_ratio="9:16", person_generation="allow_adult"),
+                types.GenerateVideosConfig(aspect_ratio="9:16"),
+            ]
+            last_cfg_err = None
+            for cfg in configs_to_try:
+                try:
+                    operation = client.models.generate_videos(
+                        model=model_id,
+                        prompt=clean_motion,
+                        image=img_obj,
+                        config=cfg,
+                    )
+                    used_model = model_id
+                    break
+                except Exception as cfg_e:
+                    last_cfg_err = cfg_e
+                    continue
+
+            if operation is not None:
+                break
+            raise last_cfg_err or RuntimeError("Falha ao iniciar operação Veo.")
+        except Exception as e:
+            errors.append(f"• {model_id} → {str(e)[:200]}")
+            continue
+
+    if operation is None:
+        raise RuntimeError(
+            "Nenhum modelo Google Veo aceitou o pedido de vídeo:\n" + "\n".join(errors)
+        )
+
+    # Aguarda conclusão assíncrona (tipicamente 30s a 120s)
+    elapsed = 0
+    max_wait = 260
+    while not getattr(operation, "done", False):
+        if elapsed >= max_wait:
+            raise RuntimeError(f"Tempo limite excedido à espera do vídeo ({used_model}).")
+        if status_cb:
+            status_cb(f"A animar cena com {used_model}... ({elapsed}s)")
+        time.sleep(8)
+        elapsed += 8
+        operation = client.operations.get(operation)
+
+    if getattr(operation, "error", None):
+        raise RuntimeError(f"Erro durante a animação Veo ({used_model}): {operation.error}")
+
+    resp = getattr(operation, "response", None) or getattr(operation, "result", None)
+    gen_vids = getattr(resp, "generated_videos", None) if resp else None
+    if not gen_vids:
+        raise RuntimeError(
+            f"O {used_model} terminou mas não devolveu vídeo (possível filtro de segurança no prompt)."
+        )
+
+    vid_ref = gen_vids[0].video
+    video_bytes = getattr(vid_ref, "video_bytes", None)
+    if not video_bytes:
+        if status_cb:
+            status_cb("A descarregar clipe animado do servidor Google...")
+        video_bytes = client.files.download(file=vid_ref)
+
+    if isinstance(video_bytes, str):
+        video_bytes = base64.b64decode(video_bytes)
+    if not video_bytes:
+        raise RuntimeError("Não foi possível obter os bytes do vídeo gerado pelo Veo.")
+    return bytes(video_bytes)
+
+
+def _fal_http_json(url: str, fal_key: str, payload: dict | None = None) -> dict:
+    headers = {
+        "Authorization": f"Key {fal_key.strip()}",
+        "Accept": "application/json",
+    }
+    data = None
+    method = "GET"
+    if payload is not None:
+        headers["Content-Type"] = "application/json"
+        data = json.dumps(payload).encode("utf-8")
+        method = "POST"
+
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=90) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="ignore")[:260]
+        raise RuntimeError(f"Erro fal.ai ({e.code}): {body}")
+
+
+def generate_video_fal(
+    img_bytes: bytes,
+    motion_prompt: str,
+    fal_key: str,
+    model_id: str,
+    status_cb=None,
+) -> bytes:
+    if not fal_key.strip():
+        raise RuntimeError("Cola a tua chave API da fal.ai na barra lateral.")
+
+    clean_model = model_id.strip().lstrip("/")
+    b64_img = base64.b64encode(img_bytes).decode("ascii")
+    data_uri = f"data:image/jpeg;base64,{b64_img}"
+
+    payload: dict = {
+        "prompt": motion_prompt.strip() or "Slow cinematic camera push-in, realistic subtle character movement",
+        "image_url": data_uri,
+    }
+    low = clean_model.lower()
+    if "kling" in low:
+        payload["duration"] = "5"
+        payload["aspect_ratio"] = "9:16"
+    elif "minimax" in low or "hailuo" in low:
+        payload["duration"] = "6"
+    elif "wan" in low:
+        payload["aspect_ratio"] = "9:16"
+
+    if status_cb:
+        status_cb(f"A colocar cena em fila na fal.ai ({clean_model})...")
+
+    queue_url = f"https://queue.fal.run/{clean_model}"
+    queued = _fal_http_json(queue_url, fal_key, payload=payload)
+
+    status_url = queued.get("status_url")
+    response_url = queued.get("response_url")
+    if not status_url or not response_url:
+        raise RuntimeError(f"Resposta inesperada da fila fal.ai: {str(queued)[:220]}")
+
+    elapsed = 0
+    max_wait = 260
+    while True:
+        st_data = _fal_http_json(status_url, fal_key)
+        st_name = st_data.get("status", "")
+        if st_name == "COMPLETED":
+            break
+        if st_name in ("FAILED", "CANCELLED"):
+            raise RuntimeError(f"A geração na fal.ai falhou: {str(st_data)[:240]}")
+        if elapsed >= max_wait:
+            raise RuntimeError("Tempo limite excedido à espera da fal.ai.")
+        if status_cb:
+            status_cb(f"fal.ai a animar ({st_name or 'em curso'})... {elapsed}s")
+        time.sleep(6)
+        elapsed += 6
+
+    result = _fal_http_json(response_url, fal_key)
+    video_url = (
+        (result.get("video") or {}).get("url")
+        or ((result.get("data") or {}).get("video") or {}).get("url")
+        or result.get("video_url")
+    )
+    if not video_url:
+        raise RuntimeError(f"A fal.ai concluiu mas não devolveu URL de vídeo: {str(result)[:240]}")
+
+    if status_cb:
+        status_cb("A descarregar clipe animado da fal.ai...")
+    with urllib.request.urlopen(video_url, timeout=120) as dl:
+        return dl.read()
+
+
+def generate_cinema_clip_bytes(
+    img_bytes: bytes,
+    motion_prompt: str,
+    video_cfg: dict,
+    status_cb=None,
+) -> bytes:
+    if video_cfg["engine"].startswith("Google Veo"):
+        return generate_video_veo(
+            img_bytes=img_bytes,
+            motion_prompt=motion_prompt,
+            api_key=video_cfg["gemini_key"],
+            preferred_model=video_cfg["veo_model"],
+            status_cb=status_cb,
+        )
+    return generate_video_fal(
+        img_bytes=img_bytes,
+        motion_prompt=motion_prompt,
+        fal_key=video_cfg["fal_key"],
+        model_id=video_cfg["fal_model"],
+        status_cb=status_cb,
+    )
 
 
 # ---------------------------------------------------------
@@ -616,7 +861,6 @@ def generate_tts_gemini_dramatic(
 
     errors = []
     audio_bytes = None
-
     for model_id in tts_candidates[:4]:
         try:
             resp = client.models.generate_content(
@@ -719,7 +963,7 @@ async def generate_tts_edge(text: str, voice: str, emotion: str, out_mp3: Path, 
 
 
 # ---------------------------------------------------------
-# MOTOR DE LEGENDAS ASS + VÍDEO (FFMPEG)
+# MOTOR DE LEGENDAS ASS + COMPOSITOR FFMPEG (HÍBRIDO)
 # ---------------------------------------------------------
 def run_cmd(cmd: list[str], cwd: Path):
     res = subprocess.run(cmd, cwd=str(cwd), capture_output=True, text=True)
@@ -815,6 +1059,38 @@ def build_zoompan_filter(motion: str, frames: int, fps: int = 30) -> str:
     )
 
 
+def normalize_animated_clip(raw_mp4: Path, target_dur: float, out_mp4: Path, cwd: Path):
+    """Normaliza clipe I2V (Veo/fal.ai/upload) para 1080x1920 @ 30fps e sincroniza com a fala."""
+    raw_dur = max(get_duration(raw_mp4), 0.5)
+    ratio = target_dur / raw_dur
+    # Limita a alteração de velocidade para o movimento humano continuar natural
+    pts_mult = max(0.78, min(1.28, ratio))
+    adjusted_dur = raw_dur * pts_mult
+    pad_sec = max(0.0, (target_dur - adjusted_dur) + 0.30)
+
+    vf_parts = [
+        f"setpts={pts_mult:.4f}*PTS",
+        "scale=1080:1920:force_original_aspect_ratio=increase",
+        "crop=1080:1920",
+        "fps=30",
+    ]
+    if pad_sec > 0.05:
+        vf_parts.append(f"tpad=stop_mode=clone:stop_duration={pad_sec:.3f}")
+    vf_parts.append("format=yuv420p")
+
+    run_cmd(
+        [
+            "ffmpeg", "-y",
+            "-i", raw_mp4.name,
+            "-vf", ",".join(vf_parts),
+            "-t", f"{target_dur:.3f}",
+            "-c:v", "libx264", "-preset", "veryfast", "-an",
+            out_mp4.name,
+        ],
+        cwd=cwd,
+    )
+
+
 def build_suspense_drone(out_audio: Path, duration_sec: float, cwd: Path):
     dur = f"{duration_sec + 1.0:.2f}"
     run_cmd(
@@ -839,8 +1115,11 @@ def render_episode(
     scenes: list[dict],
     ai_images: dict[int, bytes],
     uploaded_images: dict,
+    ai_videos: dict[int, bytes],
+    uploaded_videos: dict,
     char_voice_ids: dict[str, str],
     voice_cfg: dict,
+    video_cfg: dict,
     bgm_mode: str,
     bgm_file,
     bgm_volume: float,
@@ -873,16 +1152,24 @@ def render_episode(
         voice_direction = scene.get("voice_direction", "tense dramatic thriller tone")
         camera_motion = scene.get("camera_motion", "push_in")
         visual_prompt = scene.get("visual_prompt", "")
+        motion_prompt = scene.get("motion_prompt", "Slow cinematic camera push-in, realistic human movement")
+        render_mode = scene.get("render_mode", "fast")
 
+        # 1. Preparar imagem-base da cena
+        has_real_image = False
         if idx in uploaded_images and uploaded_images[idx] is not None:
             Image.open(uploaded_images[idx]).convert("RGB").save(img_path, format="JPEG", quality=92)
+            has_real_image = True
         elif idx in ai_images and ai_images[idx]:
             img_path.write_bytes(ai_images[idx])
+            has_real_image = True
         else:
             create_placeholder_card(img_path, idx + 1, speaker["name"], visual_prompt)
 
+        # 2. Gravar voz da personagem
+        base_pct = int((idx / total) * 72)
         progress_bar.progress(
-            int((idx / total) * 70) + 2,
+            min(95, base_pct + 2),
             text=f"Cena {idx + 1}/{total}: a gravar fala de {speaker['name']}...",
         )
         engine = voice_cfg["engine"]
@@ -899,7 +1186,7 @@ def render_episode(
                 out_wav=audio_path,
             )
             if idx < total - 1:
-                time.sleep(1.2)
+                time.sleep(1.0)
         elif engine.startswith("ElevenLabs"):
             audio_path = job_dir / f"{prefix}.mp3"
             generate_tts_elevenlabs(
@@ -923,19 +1210,49 @@ def render_episode(
         for s_ms, e_ms, txt in timings:
             ass_rows.append((offset_ms + s_ms, offset_ms + e_ms, speaker_id, txt))
 
-        fps = 30
-        frames = max(1, math.ceil(scene_dur * fps))
-        vf = build_zoompan_filter(camera_motion, frames, fps=fps)
-        run_cmd(
-            [
-                "ffmpeg", "-y", "-loop", "1", "-i", img_path.name,
-                "-vf", vf, "-t", f"{scene_dur:.3f}",
-                "-c:v", "libx264", "-preset", "veryfast", "-an",
-                clip_vid.name,
-            ],
-            cwd=job_dir,
-        )
+        # 3. Vídeo da cena: Upload MP4 -> Modo Cinema (I2V) -> Modo Rápido (FFmpeg)
+        raw_mp4_bytes = None
+        if idx in uploaded_videos and uploaded_videos[idx] is not None:
+            raw_mp4_bytes = uploaded_videos[idx].getvalue()
+        elif render_mode == "cinema":
+            if idx in ai_videos and ai_videos[idx]:
+                raw_mp4_bytes = ai_videos[idx]
+            else:
+                if not has_real_image:
+                    raise RuntimeError(
+                        f"A Cena {idx + 1} está em Modo Cinema mas ainda não tem imagem. "
+                        "Gera a imagem da cena no Passo 3 antes de animar."
+                    )
+                def _cb(msg: str):
+                    progress_bar.progress(min(95, base_pct + 6), text=f"Cena {idx + 1}/{total}: {msg}")
 
+                raw_mp4_bytes = generate_cinema_clip_bytes(
+                    img_bytes=img_path.read_bytes(),
+                    motion_prompt=motion_prompt,
+                    video_cfg=video_cfg,
+                    status_cb=_cb,
+                )
+                ai_videos[idx] = raw_mp4_bytes
+
+        if raw_mp4_bytes:
+            raw_vid_path = job_dir / f"{prefix}_raw.mp4"
+            raw_vid_path.write_bytes(raw_mp4_bytes)
+            normalize_animated_clip(raw_vid_path, scene_dur, clip_vid, cwd=job_dir)
+        else:
+            fps = 30
+            frames = max(1, math.ceil(scene_dur * fps))
+            vf = build_zoompan_filter(camera_motion, frames, fps=fps)
+            run_cmd(
+                [
+                    "ffmpeg", "-y", "-loop", "1", "-i", img_path.name,
+                    "-vf", vf, "-t", f"{scene_dur:.3f}",
+                    "-c:v", "libx264", "-preset", "veryfast", "-an",
+                    clip_vid.name,
+                ],
+                cwd=job_dir,
+            )
+
+        # 4. Fundir vídeo normalizado e voz
         run_cmd(
             [
                 "ffmpeg", "-y",
@@ -952,8 +1269,9 @@ def render_episode(
         actual_dur = get_duration(merged_vid)
         offset_ms += actual_dur * 1000
         scene_videos.append(merged_vid)
-        progress_bar.progress(int(((idx + 1) / total) * 75), text=f"Cena {idx + 1}/{total} montada...")
+        progress_bar.progress(int(((idx + 1) / total) * 76), text=f"Cena {idx + 1}/{total} concluída...")
 
+    # 5. Concatenar cenas + legendas ASS
     (job_dir / "concat.txt").write_text(
         "\n".join(f"file '{v.name}'" for v in scene_videos), encoding="utf-8"
     )
@@ -1021,23 +1339,21 @@ def render_episode(
 # ---------------------------------------------------------
 # ESTADO DA SESSÃO
 # ---------------------------------------------------------
-if "episode_title" not in st.session_state:
-    st.session_state.episode_title = ""
-if "characters" not in st.session_state:
-    st.session_state.characters = []
-if "cast_images" not in st.session_state:
-    st.session_state.cast_images = {}
-if "scenes" not in st.session_state:
-    st.session_state.scenes = []
-if "scene_images" not in st.session_state:
-    st.session_state.scene_images = {}
-if "last_video" not in st.session_state:
-    st.session_state.last_video = None
-if "script_ver" not in st.session_state:
-    st.session_state.script_ver = 0
+for key, default_val in [
+    ("episode_title", ""),
+    ("characters", []),
+    ("cast_images", {}),
+    ("scenes", []),
+    ("scene_images", {}),
+    ("scene_videos", {}),
+    ("last_video", None),
+    ("script_ver", 0),
+]:
+    if key not in st.session_state:
+        st.session_state[key] = default_val
 
-st.title("🎬 MiniDrama Studio — v4.2 (Elenco Fixo & Diálogos)")
-st.caption("Várias personagens com retrato-referência consistente, vozes individuais e diálogo dramático em 9:16.")
+st.title("🎬 MiniDrama Studio — v5 (Modo Cinema Image-to-Video)")
+st.caption("Elenco consistente + Diálogos multi-personagem + Animação real por cena (Google Veo ou fal.ai).")
 
 if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
     st.error("FFmpeg não encontrado no sistema. Confirma se o ficheiro packages.txt contém 'ffmpeg'.")
@@ -1048,30 +1364,46 @@ if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
 # ---------------------------------------------------------
 with st.sidebar:
     st.header("Configurações")
-    gemini_key = st.text_input("Chave API Google Gemini", type="password")
+    gemini_key = st.text_input("Chave API Google Gemini (Nível 1)", type="password")
     lang_label = st.selectbox("Idioma / Sotaque", list(LANGUAGES.keys()))
 
-    key_models = list_key_models(gemini_key) if gemini_key else {"all": [], "text": [], "image": [], "tts": []}
+    key_models = (
+        list_key_models(gemini_key)
+        if gemini_key
+        else {"all": [], "text": [], "image": [], "tts": [], "video": []}
+    )
     preferred_text_model = "Automático"
     preferred_image_model = "Automático"
+    preferred_veo_model = "Automático"
 
-    with st.expander("🔍 Modelos ativos nesta chave", expanded=False):
+    with st.expander("🔍 Modelos ativos nesta chave Gemini", expanded=False):
         if not gemini_key:
             st.caption("Cola a chave Gemini acima para listar os modelos.")
         elif not key_models["all"]:
-            st.warning("Não foi possível listar modelos desta chave (verifica se é válida).")
+            st.warning("Não foi possível listar modelos desta chave.")
         else:
-            preferred_text_model = st.selectbox(
-                "Modelo de Guião (Texto)",
-                ["Automático"] + key_models["text"],
+            preferred_text_model = st.selectbox("Modelo de Guião", ["Automático"] + key_models["text"])
+            preferred_image_model = st.selectbox("Modelo de Imagens", ["Automático"] + key_models["image"])
+            preferred_veo_model = st.selectbox("Modelo de Vídeo (Veo)", ["Automático"] + key_models["video"])
+            st.caption(
+                f"Texto: {len(key_models['text'])} | Imagem: {len(key_models['image'])} | "
+                f"Voz: {len(key_models['tts'])} | Veo: {len(key_models['video'])}"
             )
-            preferred_image_model = st.selectbox(
-                "Modelo de Imagens",
-                ["Automático"] + key_models["image"],
-            )
-            st.caption(f"Encontrados: {len(key_models['text'])} texto | {len(key_models['image'])} imagem | {len(key_models['tts'])} voz")
-            if not key_models["image"]:
-                st.warning("Esta chave não devolveu nenhum modelo de geração de imagem ativo.")
+
+    st.divider()
+    st.subheader("🎞️ Motor de Vídeo Animado (Modo Cinema)")
+    video_engine = st.selectbox("Provedor Image-to-Video", VIDEO_ENGINES)
+    fal_key = ""
+    fal_model_id = "fal-ai/kling-video/v1.6/standard/image-to-video"
+    if video_engine.startswith("fal.ai"):
+        fal_key = st.text_input("Chave API fal.ai", type="password")
+        fal_label = st.selectbox("Modelo fal.ai", list(FAL_VIDEO_MODELS.keys()))
+        fal_model_id = FAL_VIDEO_MODELS[fal_label]
+        custom_fal = st.text_input("Ou endpoint personalizado (opcional)", value="")
+        if custom_fal.strip():
+            fal_model_id = custom_fal.strip()
+    else:
+        st.caption("Usa o Veo através da tua chave Gemini paga. Testa 1 cena primeiro para controlar o gasto.")
 
     st.divider()
     st.subheader("🎭 Motor de Vozes do Elenco")
@@ -1079,7 +1411,6 @@ with st.sidebar:
     eleven_key = ""
     if voice_engine.startswith("ElevenLabs"):
         eleven_key = st.text_input("Chave API ElevenLabs", type="password")
-    st.caption("A voz de cada ator é escolhida individualmente no Passo 2 (Elenco).")
 
     st.divider()
     st.subheader("🎵 Ambiente Sonoro")
@@ -1100,6 +1431,14 @@ with st.sidebar:
     st.subheader("💬 Estilo do Episódio")
     color_by_char = st.checkbox("Cor de legenda diferente por personagem", value=True)
     watermark = st.checkbox("Incluir marca d'água (plano grátis)", value=True)
+
+video_cfg = {
+    "engine": video_engine,
+    "gemini_key": gemini_key,
+    "veo_model": preferred_veo_model,
+    "fal_key": fal_key,
+    "fal_model": fal_model_id,
+}
 
 # ---------------------------------------------------------
 # PASSO 1: IDEIA DO EPISÓDIO
@@ -1124,7 +1463,7 @@ with b1:
         if not gemini_key:
             st.warning("Cola a tua chave Gemini na barra lateral ou carrega o episódio de demonstração.")
         else:
-            with st.spinner("A criar o elenco e o diálogo entre personagens..."):
+            with st.spinner("A criar elenco, diálogos e direção de movimento..."):
                 try:
                     ep = generate_episode_script_gemini(
                         gemini_key, premise, genre, lang_label, num_scenes, num_chars, preferred_text_model
@@ -1134,6 +1473,7 @@ with b1:
                     st.session_state.scenes = ep["scenes"]
                     st.session_state.cast_images = {}
                     st.session_state.scene_images = {}
+                    st.session_state.scene_videos = {}
                     st.session_state.last_video = None
                     st.session_state.script_ver += 1
                     st.rerun()
@@ -1146,6 +1486,7 @@ with b2:
         st.session_state.scenes = [dict(s) for s in DEMO_EPISODE["scenes"]]
         st.session_state.cast_images = {}
         st.session_state.scene_images = {}
+        st.session_state.scene_videos = {}
         st.session_state.last_video = None
         st.session_state.script_ver += 1
         st.rerun()
@@ -1166,7 +1507,7 @@ if st.session_state.characters:
         "Gera primeiro os retratos-referência do elenco. No Passo 3, a IA vai usar exatamente estes rostos em todas as cenas."
     )
 
-    if st.button("🎭 Gerar Retratos-Referência de Todo o Elenco (Gemini)", type="primary"):
+    if st.button("🎭 Gerar Retratos-Referência de Todo o Elenco", type="primary"):
         if not gemini_key:
             st.warning("Cola a tua chave Gemini na barra lateral para gerar os retratos.")
         else:
@@ -1214,7 +1555,7 @@ if st.session_state.characters:
                     "Aparência fixa (inglês)",
                     value=ch.get("visual_profile", ""),
                     key=f"cvis_{ver}_{cid}",
-                    height=85,
+                    height=80,
                 )
 
                 up_p = st.file_uploader(
@@ -1225,9 +1566,9 @@ if st.session_state.characters:
                 if up_p is not None:
                     img_b = normalize_image_bytes(up_p.getvalue())
                     uploaded_cast[cid] = img_b
-                    st.image(img_b, caption=f"Referência de {ch['name']} (Upload)", width=180)
+                    st.image(img_b, caption=f"Referência de {ch['name']} (Upload)", width=170)
                 elif cid in st.session_state.cast_images:
-                    st.image(st.session_state.cast_images[cid], caption=f"Referência de {ch['name']} (IA)", width=180)
+                    st.image(st.session_state.cast_images[cid], caption=f"Referência de {ch['name']} (IA)", width=170)
                 else:
                     st.info("Sem retrato-referência ainda.")
 
@@ -1247,14 +1588,14 @@ char_map = {c["id"]: c for c in st.session_state.characters}
 char_ids_list = [c["id"] for c in st.session_state.characters]
 
 # ---------------------------------------------------------
-# PASSO 3: STORYBOARD COM CONSISTÊNCIA VISUAL
+# PASSO 3: STORYBOARD + ANIMAÇÃO POR CENA (HÍBRIDO)
 # ---------------------------------------------------------
 if st.session_state.scenes and st.session_state.characters:
     st.divider()
-    st.subheader("3. Storyboard de Diálogos (com Referência do Elenco)")
-
-    if not active_cast_portraits:
-        st.info("Dica: gera os retratos no Passo 2 antes de gerar as cenas para que os rostos fiquem consistentes entre planos.")
+    st.subheader("3. Storyboard, Imagens e Animação (Modo Híbrido)")
+    st.caption(
+        "Aprova primeiro as imagens (barato). Depois muda para **🎬 Cinema (I2V)** apenas nas cenas que queres animar com movimento real."
+    )
 
     if st.button("🎨 Gerar Imagens de Todas as Cenas (com Elenco Fixo)", type="primary"):
         if not gemini_key:
@@ -1265,14 +1606,16 @@ if st.session_state.scenes and st.session_state.characters:
             ok = True
             for i, scene in enumerate(st.session_state.scenes):
                 img_bar.progress(int((i / total_s) * 100), text=f"A gerar Cena {i + 1}/{total_s}...")
-                refs = []
-                for cid in scene.get("characters_in_scene", []):
-                    if cid in char_map and cid in active_cast_portraits:
-                        refs.append((char_map[cid]["name"], char_map[cid]["visual_profile"], active_cast_portraits[cid]))
+                refs = [
+                    (char_map[cid]["name"], char_map[cid]["visual_profile"], active_cast_portraits[cid])
+                    for cid in scene.get("characters_in_scene", [])
+                    if cid in char_map and cid in active_cast_portraits
+                ]
                 try:
                     st.session_state.scene_images[i] = generate_scene_image_with_refs_gemini(
                         scene.get("visual_prompt", ""), gemini_key, refs, preferred_image_model
                     )
+                    st.session_state.scene_videos.pop(i, None)
                     if i < total_s - 1:
                         time.sleep(1.0)
                 except Exception as e:
@@ -1285,6 +1628,7 @@ if st.session_state.scenes and st.session_state.characters:
                 st.rerun()
 
     uploaded_images = {}
+    uploaded_videos = {}
     motion_keys = list(CAMERA_MOTIONS.keys())
     emo_keys = list(EMOTION_PROSODY.keys())
 
@@ -1295,13 +1639,16 @@ if st.session_state.scenes and st.session_state.characters:
             scene["speaker_id"] = spk_id
         spk_name = char_map[spk_id]["name"]
 
-        with st.expander(f"Cena {i + 1} — Fala: {spk_name}", expanded=True):
-            c_txt, c_prev = st.columns([2, 1])
+        mode_badge = "🎬 CINEMA" if scene.get("render_mode") == "cinema" else "⚡ RÁPIDO"
+        has_anim = " ✅ Clipe pronto" if i in st.session_state.scene_videos else ""
+
+        with st.expander(f"Cena {i + 1} — Fala: {spk_name} | {mode_badge}{has_anim}", expanded=True):
+            c_txt, c_prev = st.columns([2, 1.1])
             with c_txt:
-                s_col1, s_col2 = st.columns([1, 1.5])
+                s_col1, s_col2, s_col3 = st.columns([1, 1.2, 1.1])
                 with s_col1:
                     scene["speaker_id"] = st.selectbox(
-                        "Quem fala nesta cena",
+                        "Quem fala",
                         char_ids_list,
                         index=char_ids_list.index(spk_id),
                         format_func=lambda cid: f"{char_map[cid]['name']} ({char_map[cid].get('role', '')})",
@@ -1312,18 +1659,27 @@ if st.session_state.scenes and st.session_state.characters:
                     if not raw_in_scene:
                         raw_in_scene = [scene["speaker_id"]]
                     scene["characters_in_scene"] = st.multiselect(
-                        "Personagens visíveis no plano",
+                        "Visíveis no plano",
                         char_ids_list,
                         default=raw_in_scene,
                         format_func=lambda cid: char_map[cid]["name"],
                         key=f"inscene_{ver}_{i}",
+                    )
+                with s_col3:
+                    cur_mode = scene.get("render_mode", "fast")
+                    scene["render_mode"] = st.selectbox(
+                        "Modo de vídeo",
+                        ["fast", "cinema"],
+                        index=1 if cur_mode == "cinema" else 0,
+                        format_func=lambda m: "🎬 Cinema (I2V Animado)" if m == "cinema" else "⚡ Rápido (Zoom FFmpeg)",
+                        key=f"mode_{ver}_{i}",
                     )
 
                 scene["dialogue"] = st.text_area(
                     "Fala da personagem",
                     value=scene.get("dialogue", ""),
                     key=f"diag_{ver}_{i}",
-                    height=68,
+                    height=64,
                 )
 
                 d1, d2, d3 = st.columns([2, 1, 1.2])
@@ -1344,7 +1700,7 @@ if st.session_state.scenes and st.session_state.characters:
                 with d3:
                     cur_mot = scene.get("camera_motion", "push_in")
                     scene["camera_motion"] = st.selectbox(
-                        "Movimento de câmara",
+                        "Câmara (Modo Rápido)",
                         motion_keys,
                         index=motion_keys.index(cur_mot) if cur_mot in motion_keys else 0,
                         format_func=lambda m: CAMERA_MOTIONS[m],
@@ -1352,54 +1708,115 @@ if st.session_state.scenes and st.session_state.characters:
                     )
 
                 scene["visual_prompt"] = st.text_area(
-                    "Prompt visual da cena (inglês)",
+                    "Prompt do fotograma inicial (inglês)",
                     value=scene.get("visual_prompt", ""),
                     key=f"vis_{ver}_{i}",
-                    height=68,
+                    height=64,
                 )
 
-                linked_names = [
-                    char_map[cid]["name"]
-                    for cid in scene["characters_in_scene"]
-                    if cid in active_cast_portraits
-                ]
-                if linked_names:
-                    st.caption(f"🔗 Retratos-referência ligados a esta cena: **{', '.join(linked_names)}**")
-                else:
-                    st.caption("⚠️ Sem retrato-referência ligado (gera o retrato no Passo 2 para manter o rosto fixo).")
+                if scene["render_mode"] == "cinema":
+                    scene["motion_prompt"] = st.text_area(
+                        "🎬 Prompt de movimento / atuação em vídeo (inglês)",
+                        value=scene.get("motion_prompt", "Slow cinematic push-in, realistic facial expression and subtle movement"),
+                        key=f"mprompt_{ver}_{i}",
+                        height=64,
+                    )
 
-                if st.button(f"🔄 Gerar / Regenerar Cena {i + 1}", key=f"regen_{ver}_{i}"):
-                    with st.spinner(f"A gerar imagem da Cena {i + 1} com o elenco..."):
-                        try:
-                            refs = [
-                                (char_map[cid]["name"], char_map[cid]["visual_profile"], active_cast_portraits[cid])
-                                for cid in scene["characters_in_scene"]
-                                if cid in char_map and cid in active_cast_portraits
-                            ]
-                            st.session_state.scene_images[i] = generate_scene_image_with_refs_gemini(
-                                scene["visual_prompt"], gemini_key, refs, preferred_image_model
-                            )
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"Erro na Cena {i + 1}: {e}")
+                btn_c1, btn_c2 = st.columns(2)
+                with btn_c1:
+                    if st.button(f"🖼️ Gerar / Refazer Imagem Cena {i + 1}", key=f"regen_{ver}_{i}", use_container_width=True):
+                        with st.spinner(f"A gerar imagem da Cena {i + 1}..."):
+                            try:
+                                refs = [
+                                    (char_map[cid]["name"], char_map[cid]["visual_profile"], active_cast_portraits[cid])
+                                    for cid in scene["characters_in_scene"]
+                                    if cid in char_map and cid in active_cast_portraits
+                                ]
+                                st.session_state.scene_images[i] = generate_scene_image_with_refs_gemini(
+                                    scene["visual_prompt"], gemini_key, refs, preferred_image_model
+                                )
+                                st.session_state.scene_videos.pop(i, None)
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Erro na Cena {i + 1}: {e}")
+
+                with btn_c2:
+                    if scene["render_mode"] == "cinema":
+                        if st.button(
+                            f"🎬 Animar só a Cena {i + 1} (I2V)",
+                            key=f"anim_{ver}_{i}",
+                            type="primary",
+                            use_container_width=True,
+                        ):
+                            base_img_bytes = None
+                            if i in st.session_state.scene_images:
+                                base_img_bytes = st.session_state.scene_images[i]
+
+                            if not base_img_bytes:
+                                st.warning("Gera ou carrega primeiro a imagem desta cena antes de a animar.")
+                            else:
+                                status_box = st.empty()
+                                try:
+                                    vid_b = generate_cinema_clip_bytes(
+                                        img_bytes=base_img_bytes,
+                                        motion_prompt=scene.get("motion_prompt", ""),
+                                        video_cfg=video_cfg,
+                                        status_cb=lambda m: status_box.info(m),
+                                    )
+                                    st.session_state.scene_videos[i] = vid_b
+                                    status_box.empty()
+                                    st.rerun()
+                                except Exception as e:
+                                    status_box.empty()
+                                    st.error(f"Erro ao animar Cena {i + 1}: {e}")
 
             with c_prev:
-                if i in st.session_state.scene_images:
-                    st.image(st.session_state.scene_images[i], caption=f"Cena {i + 1} (IA)", width=210)
+                if i in st.session_state.scene_videos:
+                    st.video(st.session_state.scene_videos[i])
+                    if st.button(f"🗑️ Remover animação Cena {i + 1}", key=f"delvid_{ver}_{i}"):
+                        st.session_state.scene_videos.pop(i, None)
+                        st.rerun()
+                elif i in st.session_state.scene_images:
+                    st.image(st.session_state.scene_images[i], caption=f"Fotograma Cena {i + 1}", width=210)
                 else:
-                    st.info("Ainda sem imagem gerada.")
+                    st.info("Sem imagem gerada ainda.")
+
                 uploaded_images[i] = st.file_uploader(
-                    "Substituir manualmente (JPG/PNG)",
+                    "Substituir imagem (JPG/PNG)",
                     type=["jpg", "jpeg", "png"],
                     key=f"img_{ver}_{i}",
                 )
+                if uploaded_images[i] is not None:
+                    st.session_state.scene_images[i] = normalize_image_bytes(uploaded_images[i].getvalue())
+
+                uploaded_videos[i] = st.file_uploader(
+                    "Ou carregar clipe animado próprio (MP4)",
+                    type=["mp4", "mov"],
+                    key=f"vidup_{ver}_{i}",
+                )
 
     # ---------------------------------------------------------
-    # PASSO 4: RENDERIZAR EPISÓDIO
+    # PASSO 4: RESUMO DE CUSTOS + RENDERIZAÇÃO FINAL
     # ---------------------------------------------------------
     st.divider()
-    st.subheader("4. Produzir Mini-Drama (9:16)")
-    if st.button("🎥 Gerar Episódio Completo com Diálogo", type="primary"):
+    st.subheader("4. Produzir Mini-Drama Final (9:16)")
+
+    cinema_total = sum(1 for sc in st.session_state.scenes if sc.get("render_mode") == "cinema")
+    cinema_ready = sum(
+        1
+        for idx, sc in enumerate(st.session_state.scenes)
+        if sc.get("render_mode") == "cinema" and idx in st.session_state.scene_videos
+    )
+    cinema_pending = cinema_total - cinema_ready
+    fast_total = len(st.session_state.scenes) - cinema_total
+
+    st.info(
+        f"**Plano de produção:** {fast_total} cena(s) em Modo Rápido | "
+        f"{cinema_ready} cena(s) animada(s) já em cache | "
+        f"**{cinema_pending} cena(s) Cinema por gerar agora** ({video_engine.split('—')[0].strip()})."
+    )
+
+    if st.button("🎥 Montar Episódio Completo (Áudio + Vídeo + Legendas)", type="primary"):
         bar = st.progress(5, text="A iniciar estúdio de produção...")
         try:
             voice_cfg = {
@@ -1413,8 +1830,11 @@ if st.session_state.scenes and st.session_state.characters:
                 scenes=st.session_state.scenes,
                 ai_images=st.session_state.scene_images,
                 uploaded_images=uploaded_images,
+                ai_videos=st.session_state.scene_videos,
+                uploaded_videos=uploaded_videos,
                 char_voice_ids=char_voice_ids,
                 voice_cfg=voice_cfg,
+                video_cfg=video_cfg,
                 bgm_mode=bgm_mode,
                 bgm_file=bgm_file,
                 bgm_volume=bgm_volume,
@@ -1432,12 +1852,12 @@ if st.session_state.last_video and Path(st.session_state.last_video).exists():
     with v_col:
         st.video(str(st.session_state.last_video))
     with d_col:
-        st.success("Episódio multi-personagem pronto em 1080×1920!")
+        st.success("Mini-drama pronto em 1080×1920!")
         with open(st.session_state.last_video, "rb") as f:
             st.download_button(
                 "⬇️ Descarregar MP4",
                 data=f.read(),
-                file_name="minidrama_episodio_v4.mp4",
+                file_name="minidrama_episodio_v5.mp4",
                 mime="video/mp4",
                 type="primary",
             )
